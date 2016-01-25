@@ -224,7 +224,7 @@ class LSTMBase(LasagneBase):
         :return:
         """
         return T.nnet.categorical_crossentropy(flattened_output,
-                                               self.target_values.reshape(
+                                               self.target_values.reshape2xy_batch_chunk(
                                                        (-1, features))).mean()
 
 
