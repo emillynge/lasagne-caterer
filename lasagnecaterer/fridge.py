@@ -4,10 +4,13 @@ For storing lasagnas!
 # builtins
 from collections import (namedtuple, OrderedDict, defaultdict)
 from collections.abc import Sequence
+from functools import partial
+from importlib import import_module
 from abc import (ABC, abstractmethod, abstractclassmethod)
 import json
 import os
 import logging
+from pprint import pprint
 from zipfile import ZipFile, ZipInfo, ZIP_BZIP2, ZIP_STORED
 import pickle
 import warnings
@@ -21,6 +24,13 @@ from numpy import ndarray
 
 # github packages
 from elymetaclasses.abc import io as ioabc
+
+# relative
+from .utils import any_to_stream
+from .recipe import LasagneBase
+from .cook import BaseCook
+from .oven import BufferedBatchGenerator
+from .menu import Options, Choices
 
 
 class JsonSaveLoadMixin(ABC):
@@ -66,13 +76,50 @@ class JsonSaveLoadMixin(ABC):
     def to_dict(self) -> dict:
         pass
 
+
+ClassDescription = namedtuple('ClassDescription', 'modulename clsname')
+
+
+class ClassDescriptionMixin:
+    @staticmethod
+    def dscr_from_class(cls: type):
+        module = sys.modules[cls.__module__]
+        modulename = module.__name__
+        clsname = cls.__name__
+        return ClassDescription(modulename, clsname)
+
+    @staticmethod
+    def class_from_dscr(descr: ClassDescription):
+        module = import_module(descr.modulename)
+        return getattr(module, descr.clsname)
+
+    @classmethod
+    def class_from_fname(cls, fname, splitter):
+        obj_name, ending = fname.split(splitter)
+        modulename = '.'.join(ending.split('.')[:-1])
+        clsname = ending.split('.')[-1]
+        klass = cls.class_from_dscr(ClassDescription(modulename, clsname))
+        return klass, obj_name
+
+
+class ClassSaveLoadMixin(JsonSaveLoadMixin, ClassDescriptionMixin):
+    def to_dict(self) -> dict:
+        descr = self.dscr_from_class(self.__class__)
+        return descr.__dict__
+
+    @classmethod
+    def from_dict(cls, *args, **kwargs):
+        descr = ClassDescription(**kwargs)
+        return cls.class_from_dscr(descr)
+
+
 class ZipSaveError(Exception):
     pass
 
 class ZipLoadError(Exception):
     pass
 
-class SaveLoadZipFilemixin:
+class SaveLoadZipFilemixin(ClassDescriptionMixin):
     pickle_classes = [SharedVariable,
                       ndarray]
 
@@ -80,21 +127,6 @@ class SaveLoadZipFilemixin:
     def _pickle_classes(self):
         return tuple(self.pickle_classes)
 
-    @staticmethod
-    def dscr_from_class(cls: type):
-        module = sys.modules[cls.__module__]
-        modulename = module.__name__
-        clsname = cls.__name__
-        return modulename, clsname
-
-    @staticmethod
-    def class_from_dsrc(fname, splitter):
-        obj_name, ending = fname.split(splitter)
-        modulename = '.'.join(ending.split('.')[:-1])
-        clsname = ending.split('.')[-1]
-        module = sys.modules[modulename]
-        klass = getattr(module, clsname)
-        return klass, obj_name
 
     @classmethod
     def write_main(cls):
@@ -123,7 +155,13 @@ class SaveLoadZipFilemixin:
             for obj_name, obj in data.items():
                 ext = None
                 buffer = io.BytesIO()
-                if isinstance(obj, JsonSaveLoadMixin):
+                if isinstance(obj, ClassSaveLoadMixin):
+                    ext = 'slcls'
+                    strbuffer = io.TextIOWrapper(buffer)
+                    obj.save(strbuffer)
+                    strbuffer.flush()
+
+                elif isinstance(obj, JsonSaveLoadMixin):
                     modulename, clsname = self.dscr_from_class(obj.__class__)
                     ext = 'sljson.' + modulename + '.' + clsname
                     strbuffer = io.TextIOWrapper(buffer)
@@ -193,6 +231,11 @@ class SaveLoadZipFilemixin:
                     elif file_info.filename == '__main__.py':
                         continue
 
+                    elif '.slcls' in fname:
+                        strobj_str = io.TextIOWrapper(obj_stream)
+                        obj = ClassSaveLoadMixin.load(strobj_str)
+                        obj_name = fname.strip('.slcls')
+
                     elif '.sljson.' in fname:
                         klass, obj_name = cls.class_from_dsrc(fname, '.sljson.')
                         strobj_str = io.TextIOWrapper(obj_stream)
@@ -260,3 +303,97 @@ class SaveLoadZipFilemixin:
     @abstractmethod
     def to_dict(self) -> OrderedDict:
         pass
+
+
+class TupperWare(OrderedDict, SaveLoadZipFilemixin):
+    """
+    A place to store stuff before putting it in the fridge
+    """
+    def to_dict(self) -> OrderedDict:
+        return self
+
+    def from_dict(cls, *args, **kwargs):
+        return cls.make(*args, **kwargs)
+
+    def bootstrap(self):
+        c = Choices('TupperWare actions', 'Container for keeping lasagnas fresh!',
+                    p='print')
+        args = c.parse_args()
+
+        if args.p:
+            pprint(self)
+
+
+    def __init__(self, *args, **kwargs):
+        if '_make_called' not in kwargs:
+            raise ValueError('Never call TupperWare directly,'
+                             'use TupperWare.make')
+        else:
+            kwargs.pop('_make_called')
+        super().__init__(*args, **kwargs)
+
+    @staticmethod
+    def _getter(key, self):
+        return self[key]
+
+    @staticmethod
+    def _setter(key, self, value):
+        self[key] = value
+
+    def __setitem__(self, key, value):
+        if key not in self or not hasattr(self, key):
+            setattr(self.__class__, key, property(partial(self._getter, key),
+                                        partial(self._setter, key)))
+
+    @classmethod
+    def make(cls, *args, **kwargs):
+        """
+        Make a new instance of Options.
+        Always use this method from instance creation
+        """
+
+        # noinspection PyShadowingNames
+        class TupperWare(cls):
+            pass
+        kwargs['_make_called'] = True
+        return TupperWare(*args, **kwargs)
+
+
+class BaseFridge(SaveLoadZipFilemixin):
+    def to_dict(self) -> OrderedDict:
+        data = OrderedDict([('opt', self.opt),
+                            ('oven', self.oven),
+                            ('recipe', self.recipe),
+                            ('cook', self.cook)
+                            ])
+
+        for owner, box in self.shelves:
+            box_label = owner + '_box'
+            data[box_label] = box
+        return data
+
+    @classmethod
+    def from_dict(cls, *args, **kwargs):
+        return cls(**kwargs)
+
+    def bootstrap(self):
+        pass
+
+    def __init__(self, opt: Options,
+                 oven_cls: type,
+                 recipe_cls: type,
+                 cook_cls: type,
+                 **boxes):
+        assert issubclass(oven_cls, BufferedBatchGenerator)
+        assert issubclass(recipe_cls, LasagneBase)
+        assert issubclass(cook_cls, BaseCook)
+        self.shelves = defaultdict(TupperWare)
+        for box_label, box in boxes.items():
+            if box_label.endswith('_box'):
+                owner = box_label[:-4]
+                self.shelves[owner] = box
+
+        self.oven = oven_cls(opt)
+        self.recipe = recipe_cls(opt)
+        self.cook = cook_cls(self.oven, self.recipe, self)
+

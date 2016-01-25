@@ -16,6 +16,7 @@ import warnings
 import sys
 import io
 from typing import (List, Tuple)
+from argparse import ArgumentParser
 
 # pip packages
 from theano.compile import SharedVariable
@@ -38,3 +39,17 @@ class Options(_Options, JsonSaveLoadMixin):
 
     def to_dict(self) -> dict:
         return {'opt_list': list(self.items())}
+
+
+class Choices(ArgumentParser):
+    def __init__(self,*argparseargs, **choices):
+        """
+        :param choices:
+                key: shortarg and dest
+                value: longarg
+        :return:
+        """
+        super().__init__(*argparseargs)
+        for shortarg, longarg in choices.items():
+            self.add_argument('-' + shortarg, '--' + longarg, dest=shortarg,
+                              action='store_true')
