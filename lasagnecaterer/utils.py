@@ -2,11 +2,20 @@
 import _pyio
 import io
 import os
-from typing import Union
+from collections import namedtuple
+from operator import attrgetter
+from typing import Union, re
+
+import sys
 from decorator import contextmanager
 from functools import singledispatch
 
+# pip
+from progressbar import (ProgressBar, Percentage, SimpleProgress, Bar, Widget)
+
 # github
+from subprocess import Popen, PIPE
+
 from elymetaclasses.annotations import type_assert
 from elymetaclasses.abc import io as ioabc
 
@@ -128,3 +137,45 @@ def bytes_to_stream(inp: bytes, output_type: Union[str, bytes]=str,
     if output_type is bytes:
         return io.BytesIO(inp)
     return io.StringIO(inp.decode())
+
+
+from elymetaclasses.events import ChainedPropsMetaClass
+from abc import ABCMeta
+
+class ChainPropsABCMetaclass(ChainedPropsMetaClass, ABCMeta):
+    pass
+
+
+class Message(Widget):
+    'Returns progress as a count of the total (e.g.: "5 of 47")'
+
+    __slots__ = ('message', 'fmt', 'max_width')
+
+    def __init__(self, message, max_width=None):
+        self.message = message
+        self.max_width = max(max_width or len(message), 1)
+        self.fmt = ' {:' + str(self.max_width) + '} '
+
+    def update(self, pbar):
+        return self.fmt.format(self.message[:self.max_width])
+
+def pbar(what, max_val, *args):
+    msg = Message(*args)
+    return ProgressBar(max_val, fd=sys.stdout,
+                       widgets=[SimpleProgress(),
+                                what, msg,
+                                Percentage(), Bar(), '\n']), msg
+
+
+GPU = namedtuple('GPU', 'dev free')
+dev_used_tot = re.compile('Device  (\d).+ (\d+) of (\d+) MiB Used')
+
+def gpus():
+    for line in Popen(['cuda-smi'], stdout=PIPE).stdout.read().decode('utf8').split('\n')[:-1]:
+        dev, used, tot = dev_used_tot.findall(line)[0]
+        free = int(tot) - int(used)
+        yield GPU(int(dev), free)
+
+def best_gpu():
+    g = sorted(gpus(), key=attrgetter('free'), reverse=True)
+    return g[0]
