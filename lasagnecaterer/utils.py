@@ -4,7 +4,7 @@ import inspect
 import io
 import _pyio  # for subclassing
 import os
-from collections import namedtuple, OrderedDict, deque, Generator, defaultdict
+from collections import namedtuple, OrderedDict, deque, Generator, defaultdict, MutableSequence
 from operator import attrgetter, itemgetter
 from typing import Union, List
 import re
@@ -28,11 +28,12 @@ except AssertionError:
 
 import numpy as np
 from progressbar import (ProgressBar, Percentage, SimpleProgress, Bar, Widget)
-from bokeh.models import ColumnDataSource, Range1d, FactorRange, HoverTool
+from bokeh.models import ColumnDataSource, Range1d, FactorRange, HoverTool, TextEditor
 from bokeh.plotting import figure, hplot, vplot, gridplot
 from bokeh.client import push_session
 from bokeh.io import curdoc
-from bokeh.models.widgets.markups import Paragraph
+from bokeh.palettes import RdYlGn5
+from bokeh.models.widgets.tables import DataTable
 
 # github
 from elymetaclasses.annotations import type_assert
@@ -281,7 +282,7 @@ class BokehConsole:
 
     def make_plot(self):
         p = figure(y_range=(Range1d(-1, self.n + 1)),
-                   x_range=(Range1d(-2, self.max_line_len + 1)), tools='',
+                   x_range=(Range1d(-2, self.max_line_len + 1)), tools='hover',
                    width=int(self.max_line_len * 6.35 + 160),
                    height=(self.n + 2) * 16 + 100)
         p.text('zeros', 'line', 'text', source=self.source)
@@ -312,6 +313,8 @@ class BokehConsole:
                     else:
                         tokens.append(token)
 
+
+JobProgress = namedtuple('JobProgress', 'name percent state')
 
 # Unless explicitly defined as Nvidia device all GPUs are considered as cuda
 # devices
@@ -529,7 +532,7 @@ class RessourceMonitor:
         return procs
 
     async def _nvproc2proc(self, subproc_exec, nvproc: GPUNvProcess,
-                           pid2owner: dict, nv2cuda: dict, gpu_procs: dict):
+                           pid2owner: dict, nv2cuda: dict, gpu_nvprocs: dict):
         if nvproc.pid not in pid2owner:
             owner = await self.find_pid_owner_coro(nvproc.pid,
                                                    subproc_exec=subproc_exec)
@@ -538,10 +541,10 @@ class RessourceMonitor:
             prev_proc = None
         else:
             owner = pid2owner[nvproc.pid]
-            prev_proc = gpu_procs.get(nvproc.pid, None)
+            prev_proc = gpu_nvprocs.get(nvproc.pid, None)
 
-        if prev_proc != nvproc[2:]:
-            gpu_procs[nvproc.pid] = nvproc[2:]
+        if prev_proc != nvproc:
+            gpu_nvprocs[nvproc.pid] = nvproc
             proc = GPUProcess(nvproc.pid, owner, nv2cuda[nvproc.nvdev],
                               nvproc.memusage)
             await self.change_stream.put(proc)
@@ -559,7 +562,7 @@ class RessourceMonitor:
 
         loop = loop or asyncio.get_event_loop()
         gpus = dict()
-        gpu_procs = dict()
+        gpu_nvprocs = dict()
         do_GPUComb = GPUComb not in ignore
         do_GPUProcess = GPUProcess not in ignore
         nvdev = None
@@ -594,20 +597,20 @@ class RessourceMonitor:
                                                            nvproc,
                                                            pid2owner,
                                                            nv2cuda,
-                                                           gpu_procs)))
+                                                           gpu_nvprocs)))
                     continue
 
             if tasks:
                 await asyncio.wait(tasks)
                 tasks.clear()
 
-                dead_pids = set(gpu_procs.keys()).difference(seen_pids)
-                for dead_proc in (gpu_procs[pid] for pid in dead_pids):
+                dead_pids = set(gpu_nvprocs.keys()).difference(seen_pids)
+                for dead_proc in (gpu_nvprocs[pid] for pid in dead_pids):
                     await self.change_stream.put(GPUProcess(dead_proc.pid,
                                                             pid2owner[dead_proc.pid],
                                                             nv2cuda[dead_proc.nvdev],
                                                             0))
-                    gpu_procs.pop(dead_proc.pid)
+                    gpu_nvprocs.pop(dead_proc.pid)
                 seen_pids.clear()
 
 
@@ -692,11 +695,101 @@ class RessourceMonitor:
         return pid2owner
 
 
-class ChangeConsumer:
-    def __init__(self, change_stream: asyncio.Queue):
-        self.change_stream = change_stream
+BytesStdOut = namedtuple('BytesStdOut', 'bytes')
+TextStdOut = namedtuple('TextStdOut', 'text')
+BytesStdErr = namedtuple('BytesStdErr', 'bytes')
+TextStdErr = namedtuple('TextStdErr', 'text')
+
+
+class ChangeStream(asyncio.Queue):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.sentinel2waiters = defaultdict(list)
         self.terminated = False
+
+    class BytesRedirecter:
+        def __init__(self, change_stream: asyncio.Queue, copy_out, wrap_class=BytesStdOut):
+            self.change_stream = change_stream
+            self._copy_out = copy_out
+            self.wrap_class = wrap_class
+            self.put_bytes = True if hasattr(wrap_class, 'bytes') else False
+
+        def write(self, b):
+            is_bytes = isinstance(b, bytes)
+            # no change needed
+            if (is_bytes and self.put_bytes) or (not is_bytes and not self.put_bytes):
+                    self.change_stream.put_nowait(self.wrap_class(b))
+
+            # is bytes, but should be str
+            elif is_bytes:
+                self.change_stream.put_nowait(self.wrap_class(b.decode()))
+
+            # is not bytes, but should be
+            else:
+                self.change_stream.put_nowait(self.wrap_class(b.encode()))
+
+            if self._copy_out:
+                self._copy_out.write(b)
+
+    class TextRedirecter:
+        def __init__(self, change_stream:  asyncio.Queue, copy_out, wrap_class=TextStdOut):
+            self.change_stream = change_stream
+            self._copy_out = copy_out
+            self.wrap_class = wrap_class
+            self.put_str = True if hasattr(wrap_class, 'text') else False
+
+        def write(self, s):
+            is_text = isinstance(s, str)
+            # no change needed
+            if (is_text and self.put_str) or (not is_text and not self.put_str):
+                    self.change_stream.put_nowait(self.wrap_class(s))
+
+            # is bytes, but should be str
+            elif not is_text:
+                self.change_stream.put_nowait(self.wrap_class(s.decode()))
+
+            # is not bytes, but should be
+            else:
+                self.change_stream.put_nowait(self.wrap_class(s.encode()))
+
+            if self._copy_out:
+                self._copy_out.write(s)
+
+    @contextmanager
+    def redirect_stdout(self, copy=False, out_type=str, **kwargs):
+        if copy:
+            copy_out = sys.stdout
+        else:
+            copy_out = None
+
+        if out_type is str:
+            redirecter = self.TextRedirecter(self, copy_out, **kwargs)
+        else:
+            redirecter = self.BytesRedirecter(self, copy_out, **kwargs)
+
+        stdout, sys.stdout = sys.stdout, redirecter  # io.TextIOWrapper(self)
+        yield
+        sys.stdout = stdout
+
+    @contextmanager
+    def redirect_stderr(self, copy=False, out_type=str, **kwargs):
+        if copy:
+            copy_out = sys.stdout
+        else:
+            copy_out = None
+
+        if out_type is str:
+            if 'wrap_class' not in kwargs:
+                kwargs['wrap_class'] = TextStdErr
+            redirecter = self.TextRedirecter(self, copy_out, **kwargs)
+        else:
+            if 'wrap_class' not in kwargs:
+                kwargs['wrap_class'] = BytesStdErr
+            redirecter = self.BytesRedirecter(self, copy_out, **kwargs)
+
+        stdout, sys.stderr = sys.stderr, redirecter  # io.TextIOWrapper(self)
+        yield
+        sys.stderr = stdout
 
     def register_waiter(self, waiter_coro):
         if inspect.isfunction(waiter_coro):
@@ -706,7 +799,7 @@ class ChangeConsumer:
 
     async def start(self):
         while not self.terminated:
-            change = await self.change_stream.get()
+            change = await self.get()
             for sentinel, waiters in self.sentinel2waiters.items():
                 if isinstance(change, sentinel):
                     dead_waiters = list()
@@ -718,24 +811,44 @@ class ChangeConsumer:
                     for waiter in dead_waiters:
                         waiters.remove(waiter)
 
+@contextmanager
+def redirect_to_changestream(change_stream: asyncio.Queue, err=False):
+    stdout = sys.stdout
+
+
 
 class BokehPlots:
-    def __init__(self, change_consumer: ChangeConsumer):
+    def __init__(self, change_consumer: ChangeStream):
         self.change_consumer = change_consumer
         self.terminated = False
 
     @staticmethod
+    def _drop_in(data, field, idx, val):
+        data[field] = data[field][:idx] + [val] + data[field][idx + 1:]
+
+    @staticmethod
     def _bar_source(names, *val_pairs):
+        l = len(names)
         d = {
-            'zeros': [0] * len(names),
+            'zeros': [0] * l,
             'name': [str(n) for n in names],
             'name_low': [str(n) + ':0.9' for n in names],
             'name_high': [str(n) + ':0.1' for n in names]
         }
         for val_name, values in val_pairs:
-            d[val_name] = values
+            if isinstance(values, (tuple, MutableSequence)):
+                d[val_name] = values
+            else:
+                d[val_name] = [values] * l
 
         return d
+
+    @staticmethod
+    def _swapaxes(kwargs):
+        kwargs['x_range'], kwargs['y_range'] = kwargs['y_range'], kwargs[
+                'x_range']
+        kwargs['x_axis_label'], kwargs['y_axis_label'] = kwargs['y_axis_label'], kwargs[
+                'x_axis_label']
 
     def cpu_bars(self, vertical=True, **kwargs):
         cpus = sorted(RessourceMonitor.cpus(), key=itemgetter(0))
@@ -746,12 +859,13 @@ class BokehPlots:
         name_range = FactorRange(factors=source.data['name'])
         kwargs['x_range'] = name_range
         kwargs['y_range'] = val_range
+        kwargs['x_axis_label'] = 'device'
+        kwargs['y_axis_label'] = '%'
 
         if not vertical:
-            kwargs['x_range'], kwargs['y_range'] = kwargs['y_range'], kwargs[
-                'x_range']
+            self._swapaxes(kwargs)
 
-        p = figure(**kwargs, tools='hover')
+        p = figure(**kwargs, tools='hover', title='CPU load')
 
         if vertical:
             p.quad(left='name_low', right='name_high', top='load',
@@ -783,29 +897,27 @@ class BokehPlots:
         def waiter():
             change = yield GPUComb
             while not self.terminated:
-                loads = source.data['load']
-                loads[change.dev] = change.load
-                free_mems = source.data['free']
-                free_mems[change.dev] = change.free
-
-                source.data['load'] = list(loads)
-                source.data['free_mems'] = list(free_mems)
+                self._drop_in(source.data, 'load', change.dev, change.load)
+                self._drop_in(source.data, 'free', change.dev, change.free)
                 change = yield
 
         self.change_consumer.register_waiter(waiter())
 
         name_range = FactorRange(factors=source.data['name'])
 
-        def makefig(name_range, val_range, val_name):
+        def makefig(name_range, val_range, val_name, title, ylabel):
             kwargs['x_range'] = name_range
             kwargs['y_range'] = val_range
-            if not vertical:
-                kwargs['x_range'], kwargs['y_range'] = kwargs['y_range'], kwargs[
-                'x_range']
-            return figure(**kwargs, tools=[])
+            kwargs['x_axis_label'] = 'device'
+            kwargs['y_axis_label'] = ylabel
 
-        p1, p2 = (makefig(name_range, Range1d(0, 100), 'load'),
-                  makefig(name_range, Range1d(0, max_free), 'free'))
+            if not vertical:
+                self._swapaxes(kwargs)
+            return figure(**kwargs, tools=[], title=title)
+
+        p1, p2 = (makefig(name_range, Range1d(0, 100), 'load', 'GPU load', '%'),
+                  makefig(name_range, Range1d(0, max_free), 'free', 'GPU free memory', 'MiB'))
+
 
         if vertical:
             p = vplot(p1,p2)
@@ -840,12 +952,14 @@ class BokehPlots:
         name_range = FactorRange(factors=source.data['name'])
         kwargs['x_range'] = name_range
         kwargs['y_range'] = val_range
+        kwargs['x_axis_label'] = 'username'
+        kwargs['y_axis_label'] = 'MiB'
 
         if not vertical:
-            kwargs['x_range'], kwargs['y_range'] = kwargs['y_range'], kwargs[
-                'x_range']
+            self._swapaxes(kwargs)
 
-        p = figure(**kwargs, tools=[])
+        p = figure(**kwargs, tools=[], title='Memory usage',
+                   )
 
         if vertical:
             p.quad(left='name_low', right='name_high', top='memusage',
@@ -877,6 +991,71 @@ class BokehPlots:
 
         return p
 
+    def console(self, stdout=True, stderr=True, **kwargs):
+        console_kwargs = dict((key, kwargs[key]) for key in ['n', 'max_line_len', 'input_bottom'] if key in kwargs)
+
+        consoles = list()
+
+        def waiter(sentinel, console: BokehConsole):
+            change = yield sentinel
+            if hasattr(sentinel, 'bytes'):
+                while not self.terminated:
+                    console.output_text(change.bytes.decode())
+                    change = yield
+            else:
+                while not self.terminated:
+                    console.output_text(change.text)
+                    change = yield
+
+        if stdout:
+            c = BokehConsole(**console_kwargs)
+            self.change_consumer.register_waiter(waiter(BytesStdOut, c))
+            self.change_consumer.register_waiter(waiter(TextStdOut, c))
+            consoles.append(c)
+
+        if stderr:
+            c = BokehConsole(**console_kwargs)
+            self.change_consumer.register_waiter(waiter(BytesStdErr, c))
+            self.change_consumer.register_waiter(waiter(TextStdErr, c))
+            consoles.append(c)
+
+        if len(consoles) == 1:
+            return consoles[0].p
+        return hplot(*(c.p for c in consoles))
+
+    def progress(self, job_names, **kwargs):
+        job_name2idx = dict((name, i) for i, name in enumerate(job_names))
+        state2color = dict(zip(['dead', 'queued', 'init', 'running',
+                                 'complete'], reversed(RdYlGn5)))
+        source = ColumnDataSource(self._bar_source(job_names, ('percent', 0),
+                                                   ('color', RdYlGn5[1])))
+        p = figure(
+            x_range=Range1d(0, 100), height=(100 + 30 * len(job_names)),
+            width=400,
+            y_range=FactorRange(factors=source.data['name']),
+            tools=[HoverTool(tooltips=[("job", "@name"),
+                                       ("percent", "@percent")])],
+            x_axis_label='%', y_axis_label='jobname',
+            title='Job progress'
+
+        )
+
+        p.quad(left='zeros', right='percent', top='name_high',
+                  bottom='name_low', fill_color='color', source=source)
+
+        @self.change_consumer.register_waiter
+        def waiter():
+            change = yield JobProgress
+            while not self.terminated:
+                idx = job_name2idx.get(change.name, None)
+                if None:
+                    warnings.warn('unknown job!: "{}"'.format(change))
+                self._drop_in(source.data, 'percent', idx, change.percent)
+
+                if state2color[change.state] != source.data['color'][idx]:
+                    self._drop_in(source.data, 'color', idx, state2color[change.state])
+                change = yield
+        return p
 
     def serve(self, host='localhost', port=5006, session_id='test'):
         url = 'http://' + host + ':' + str(port) + '/'
