@@ -27,11 +27,6 @@ from elymetaclasses.abc import io as ioabc
 
 # relative
 from .utils import any_to_stream
-from .recipe import LasagneBase
-from .cook import BaseCook
-from .oven import BufferedBatchGenerator
-from .menu import Options, Choices
-
 
 class JsonSaveLoadMixin(ABC):
     """
@@ -81,6 +76,10 @@ ClassDescription = namedtuple('ClassDescription', 'modulename clsname')
 
 
 class ClassDescriptionMixin:
+    @classmethod
+    def class_descr(cls):
+        return cls.dscr_from_class(cls)
+
     @staticmethod
     def dscr_from_class(cls: type):
         module = sys.modules[cls.__module__]
@@ -102,10 +101,10 @@ class ClassDescriptionMixin:
         return klass, obj_name
 
 
-class ClassSaveLoadMixin(JsonSaveLoadMixin, ClassDescriptionMixin):
+class ClassSaveLoadMixin(ClassDescriptionMixin, JsonSaveLoadMixin):
     def to_dict(self) -> dict:
         descr = self.dscr_from_class(self.__class__)
-        return descr.__dict__
+        return descr._asdict()
 
     @classmethod
     def from_dict(cls, *args, **kwargs):
@@ -119,7 +118,8 @@ class ZipSaveError(Exception):
 class ZipLoadError(Exception):
     pass
 
-class SaveLoadZipFilemixin(ClassDescriptionMixin):
+
+class SaveLoadZipFilemixin(ClassDescriptionMixin, ABC):
     pickle_classes = [SharedVariable,
                       ndarray]
 
@@ -234,15 +234,15 @@ class SaveLoadZipFilemixin(ClassDescriptionMixin):
                     elif '.slcls' in fname:
                         strobj_str = io.TextIOWrapper(obj_stream)
                         obj = ClassSaveLoadMixin.load(strobj_str)
-                        obj_name = fname.strip('.slcls')
+                        obj_name = fname[:-6]
 
                     elif '.sljson.' in fname:
-                        klass, obj_name = cls.class_from_dsrc(fname, '.sljson.')
+                        klass, obj_name = cls.class_from_fname(fname, '.sljson.')
                         strobj_str = io.TextIOWrapper(obj_stream)
                         obj = klass.load(strobj_str)
 
                     elif '.slzip.' in fname:
-                        klass, obj_name = cls.class_from_dsrc(fname, '.slzip.')
+                        klass, obj_name = cls.class_from_fname(fname, '.slzip.')
                         buffer = io.BytesIO(obj_stream.read())
                         buffer.seek(0)
                         obj = klass.load(buffer)
@@ -287,13 +287,15 @@ class SaveLoadZipFilemixin(ClassDescriptionMixin):
             self._save(file, data, **kwargs)
 
     @classmethod
-    def load(cls, file, **kwargs):
+    def load(cls, file, data_overrides: dict=None, **kwargs):
         if isinstance(file, str):
             with open(file, 'rb') as fp:
                 data = cls._load(fp, **kwargs)
         else:
             data = cls._load(file, **kwargs)
 
+        if data_overrides:
+            data.update(data_overrides)
         return cls.from_dict(**data)
 
     @abstractclassmethod
@@ -312,10 +314,12 @@ class TupperWare(OrderedDict, SaveLoadZipFilemixin):
     def to_dict(self) -> OrderedDict:
         return self
 
+    @classmethod
     def from_dict(cls, *args, **kwargs):
         return cls.make(*args, **kwargs)
 
     def bootstrap(self):
+        from .menu import Choices
         c = Choices('TupperWare actions', 'Container for keeping lasagnas fresh!',
                     p='print')
         args = c.parse_args()
@@ -344,6 +348,7 @@ class TupperWare(OrderedDict, SaveLoadZipFilemixin):
         if key not in self or not hasattr(self, key):
             setattr(self.__class__, key, property(partial(self._getter, key),
                                         partial(self._setter, key)))
+        super().__setitem__(key, value)
 
     @classmethod
     def make(cls, *args, **kwargs):
@@ -359,41 +364,58 @@ class TupperWare(OrderedDict, SaveLoadZipFilemixin):
         return TupperWare(*args, **kwargs)
 
 
-class BaseFridge(SaveLoadZipFilemixin):
+class BaseFridge(SaveLoadZipFilemixin, ClassDescriptionMixin):
+    def __init__(self, opt,
+                 oven_cls: type,
+                 recipe_cls: type,
+                 cook_cls: type,
+                 **boxes):
+        self.shelves = defaultdict(TupperWare.make)
+        for box_label, box in boxes.items():
+            if box_label.endswith('_box'):
+                owner = box_label[:-4]
+                self.shelves[owner] = box
+        self.opt = opt
+        self.oven = oven_cls(opt)
+        self.recipe = recipe_cls(opt)
+        self.cook = cook_cls(opt, self.oven, self.recipe, self)
+
     def to_dict(self) -> OrderedDict:
-        data = OrderedDict([('opt', self.opt),
-                            ('oven', self.oven),
-                            ('recipe', self.recipe),
-                            ('cook', self.cook)
+        data = OrderedDict([('fridge', self.class_descr()),
+                            ('opt', self.opt),
+                            ('oven_cls', self.oven),
+                            ('recipe_cls', self.recipe),
+                            ('cook_cls', self.cook)
                             ])
 
-        for owner, box in self.shelves:
+        for owner, box in self.shelves.items():
             box_label = owner + '_box'
             data[box_label] = box
         return data
 
     @classmethod
     def from_dict(cls, *args, **kwargs):
+        kwargs.pop('fridge', None)
+
         return cls(**kwargs)
 
     def bootstrap(self):
         pass
 
-    def __init__(self, opt: Options,
-                 oven_cls: type,
-                 recipe_cls: type,
-                 cook_cls: type,
-                 **boxes):
-        assert issubclass(oven_cls, BufferedBatchGenerator)
-        assert issubclass(recipe_cls, LasagneBase)
-        assert issubclass(cook_cls, BaseCook)
-        self.shelves = defaultdict(TupperWare)
-        for box_label, box in boxes.items():
-            if box_label.endswith('_box'):
-                owner = box_label[:-4]
-                self.shelves[owner] = box
 
-        self.oven = oven_cls(opt)
-        self.recipe = recipe_cls(opt)
-        self.cook = cook_cls(self.oven, self.recipe, self)
+class UniversalFridgeLoader(SaveLoadZipFilemixin):
+    def __init__(self):
+        raise NotImplementedError('This class should not be instantiated!')
 
+    def to_dict(self) -> OrderedDict:
+        raise NotImplementedError('This class can only load!')
+
+    @classmethod
+    def from_dict(cls, *args, **kwargs):
+        fridge_descr = ClassDescription(*kwargs.pop('fridge'))
+        klass = cls.class_from_dscr(fridge_descr)
+        assert issubclass(klass, BaseFridge)
+        return klass.from_dict(*args, **kwargs)
+
+    def bootstrap(self):
+        pass

@@ -22,7 +22,8 @@ import theano
 import lasagne as L
 import numpy as np
 import requests
-from threading import Lock, LockType
+from threading import Lock
+from _thread import LockType
 
 # github packages
 from elymetaclasses.events import ChainedProps, args_from_opt
@@ -30,10 +31,10 @@ from elymetaclasses.annotations import SingleDispatch, LastResort, type_assert
 from elymetaclasses.abc import io as ioabc
 
 # relative imports
-from .fridge import JsonSaveLoadMixin
 from .utils import (from_start, any_to_stream)
-DEBUGFLAGS = ['nocache']
+from .fridge import JsonSaveLoadMixin, ClassSaveLoadMixin
 
+DEBUGFLAGS = []#'nocache']
 
 
 class CharMap(OrderedDict, JsonSaveLoadMixin):
@@ -86,10 +87,10 @@ class CharMap(OrderedDict, JsonSaveLoadMixin):
 
     @classmethod
     def from_dict(cls, data: dict, max_i=None):
-        return cls(data, max_i=max_i)
+        return cls(max_i=max_i, **data)
 
     def to_dict(self):
-        return {'data': self.data, 'max_i': self.max_i}
+        return {'data': dict(self), 'max_i': self.max_i}
 
     @classmethod
     def from_text(cls, inp):
@@ -190,8 +191,8 @@ class BatchBuffer(io.StringIO):
     def from_self(cls, *args, **kwargs):
         return cls(*args, **kwargs)
 
-
-class BufferedBatchGenerator(ChainedProps):
+from .utils import ChainPropsABCMetaclass
+class BufferedBatchGenerator(ChainedProps, ClassSaveLoadMixin, metaclass=ChainPropsABCMetaclass):
     debug = DEBUGFLAGS
 
     @property
@@ -301,15 +302,15 @@ class FullArrayBatchGenerator(CharmappedBatchGenerator):
 
     @property
     def train_view_flat(self):
-        return self.train_full[:self.bools_per_batch + 1].flatten()
+        return self.train_full[:self.bools_per_batch].flatten()
 
     @property
     def val_view_flat(self):
-        return self.val_full[:self.bools_per_batch + 1].flatten()
+        return self.val_full[:self.bools_per_batch].flatten()
 
     @property
     def test_view_flat(self):
-        return self.test_full[:self.bools_per_batch + 1].flatten()
+        return self.test_full[:self.bools_per_batch].flatten()
 
     @args_from_opt(1)
     def reshape2xy_batch_chunk(self, flat, batch_sz, seq_len, win_sz, features, seq_overlap=True, batch_overlap=True):
@@ -329,8 +330,8 @@ class FullArrayBatchGenerator(CharmappedBatchGenerator):
 
         x = flat[:-features]    # all, excluding last element which has len == features
         y = flat[features:]  # all, excluding first element which has len == features
-        return (x.reshape2xy_batch_chunk((batch_sz, seq_len, features)),
-                y.reshape2xy_batch_chunk((batch_sz, seq_len, features)))
+        return (x.reshape((batch_sz, seq_len, win_sz, features)),
+                y.reshape((batch_sz, seq_len, features)))
 
     # noinspection PyMethodOverriding
     @property
@@ -353,9 +354,10 @@ class FullArrayBatchGenerator(CharmappedBatchGenerator):
         BPE = namedtuple('BPE', 'train val test')
         return BPE(*(l // cpb for l in self.stream_lengths))
 
-    def prepare_flat_array(self, part):
+    @args_from_opt(1)
+    def prepare_flat_array(self, part, features):
         lock = self.get_lock(part)
-        if lock.locked:
+        if lock.locked():
             raise PermissionError('{} is already has a generator working on it.'
                                   'If you need multiple generators you should '
                                   'copy this oven'.format(part))
@@ -367,14 +369,15 @@ class FullArrayBatchGenerator(CharmappedBatchGenerator):
 
             # total length of flat
             bpb = self.bools_per_batch
+
             bpe = getattr(self.batches_per_epoch, part)
 
-            max_i = (bpe - 1) * bpb
+            max_c = ((bpe - 1) * bpb) // features
 
             if mode == 'simple':
                 shuffle = lambda j:  j + bpb
             elif mode == 'random':
-                shuffle = lambda j: np.random.random_integers(0, max_i)
+                shuffle = lambda j: np.random.random_integers(0, max_c) * features
             else:
                 raise ValueError('unknown mode "{}"'.format(mode))
 
@@ -397,14 +400,14 @@ class FullArrayBatchGenerator(CharmappedBatchGenerator):
         """
         # batch arrays
         reshaped = getattr(self, part)
-
+        bpe = getattr(self.batches_per_epoch, part)
         if batches < 0:
-            for _ in self.prepare_flat_array(part):
-                yield reshaped
-        else:
-            gen = self.prepare_flat_array(part)
-            for b in range(batches):
-                yield reshaped
+            batches = bpe
+
+        gen = self.prepare_flat_array(part)
+        for b in range(batches):
+            next(gen)
+            yield reshaped
 
     def iter_epoch(self, epochs, part='train'):
         for e in range(epochs):

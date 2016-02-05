@@ -4,7 +4,8 @@ import inspect
 import io
 import _pyio  # for subclassing
 import os
-from collections import namedtuple, OrderedDict, deque, Generator, defaultdict, MutableSequence
+from collections import namedtuple, OrderedDict, deque, Generator, defaultdict, \
+    MutableSequence
 from operator import attrgetter, itemgetter
 from typing import Union, List
 import re
@@ -28,11 +29,12 @@ except AssertionError:
 
 import numpy as np
 from progressbar import (ProgressBar, Percentage, SimpleProgress, Bar, Widget)
-from bokeh.models import ColumnDataSource, Range1d, FactorRange, HoverTool, TextEditor
+from bokeh.models import ColumnDataSource, Range1d, FactorRange, HoverTool, \
+    TextEditor
 from bokeh.plotting import figure, hplot, vplot, gridplot
 from bokeh.client import push_session
 from bokeh.io import curdoc
-from bokeh.palettes import RdYlGn5
+from bokeh.palettes import RdYlGn5, RdYlGn7
 from bokeh.models.widgets.tables import DataTable
 
 # github
@@ -233,6 +235,7 @@ class AsyncProcWrapper:
         out = await self.stdout.read()
         return out, err
 
+
 async def async_subprocess(*args, **kwargs):
     return await AsyncProcWrapper.create(*args, **kwargs)
 
@@ -299,6 +302,8 @@ class BokehConsole:
 
     def output_text(self, s):
         for line in s.split('\n'):
+            if not line:
+                continue
             if len(line) <= self.max_line_len:
                 self._push_line(line)
             else:
@@ -312,10 +317,11 @@ class BokehConsole:
                         i = len(token)
                     else:
                         tokens.append(token)
+                self._push_line(' '.join(tokens))
 
 
 JobProgress = namedtuple('JobProgress', 'name percent state')
-
+Command = namedtuple('Command', 'command args kwargs')
 # Unless explicitly defined as Nvidia device all GPUs are considered as cuda
 # devices
 CPU = namedtuple('CPU', 'dev load')
@@ -607,12 +613,13 @@ class RessourceMonitor:
                 dead_pids = set(gpu_nvprocs.keys()).difference(seen_pids)
                 for dead_proc in (gpu_nvprocs[pid] for pid in dead_pids):
                     await self.change_stream.put(GPUProcess(dead_proc.pid,
-                                                            pid2owner[dead_proc.pid],
-                                                            nv2cuda[dead_proc.nvdev],
+                                                            pid2owner[
+                                                                dead_proc.pid],
+                                                            nv2cuda[
+                                                                dead_proc.nvdev],
                                                             0))
                     gpu_nvprocs.pop(dead_proc.pid)
                 seen_pids.clear()
-
 
     @staticmethod
     def cpus(subproc_exec=Popen):
@@ -674,7 +681,7 @@ class RessourceMonitor:
     def pid2owner(subproc_exec=Popen):
         p = subproc_exec('ps', '-A', '-o', 'pid,user', 'h',
                          stdout=PIPE,
-                               stderr=PIPE)
+                         stderr=PIPE)
         data, err = p.communicate()
         if err:
             raise IOError(err)
@@ -708,7 +715,8 @@ class ChangeStream(asyncio.Queue):
         self.terminated = False
 
     class BytesRedirecter:
-        def __init__(self, change_stream: asyncio.Queue, copy_out, wrap_class=BytesStdOut):
+        def __init__(self, change_stream: asyncio.Queue, copy_out,
+                     wrap_class=BytesStdOut):
             self.change_stream = change_stream
             self._copy_out = copy_out
             self.wrap_class = wrap_class
@@ -717,8 +725,9 @@ class ChangeStream(asyncio.Queue):
         def write(self, b):
             is_bytes = isinstance(b, bytes)
             # no change needed
-            if (is_bytes and self.put_bytes) or (not is_bytes and not self.put_bytes):
-                    self.change_stream.put_nowait(self.wrap_class(b))
+            if (is_bytes and self.put_bytes) or (
+                        not is_bytes and not self.put_bytes):
+                self.change_stream.put_nowait(self.wrap_class(b))
 
             # is bytes, but should be str
             elif is_bytes:
@@ -731,8 +740,13 @@ class ChangeStream(asyncio.Queue):
             if self._copy_out:
                 self._copy_out.write(b)
 
+        def flush(self):
+            if self._copy_out:
+                self._copy_out.flush()
+
     class TextRedirecter:
-        def __init__(self, change_stream:  asyncio.Queue, copy_out, wrap_class=TextStdOut):
+        def __init__(self, change_stream: asyncio.Queue, copy_out,
+                     wrap_class=TextStdOut):
             self.change_stream = change_stream
             self._copy_out = copy_out
             self.wrap_class = wrap_class
@@ -742,7 +756,7 @@ class ChangeStream(asyncio.Queue):
             is_text = isinstance(s, str)
             # no change needed
             if (is_text and self.put_str) or (not is_text and not self.put_str):
-                    self.change_stream.put_nowait(self.wrap_class(s))
+                self.change_stream.put_nowait(self.wrap_class(s))
 
             # is bytes, but should be str
             elif not is_text:
@@ -754,6 +768,10 @@ class ChangeStream(asyncio.Queue):
 
             if self._copy_out:
                 self._copy_out.write(s)
+
+        def flush(self):
+            if self._copy_out:
+                self._copy_out.flush()
 
     @contextmanager
     def redirect_stdout(self, copy=False, out_type=str, **kwargs):
@@ -811,10 +829,10 @@ class ChangeStream(asyncio.Queue):
                     for waiter in dead_waiters:
                         waiters.remove(waiter)
 
+
 @contextmanager
 def redirect_to_changestream(change_stream: asyncio.Queue, err=False):
     stdout = sys.stdout
-
 
 
 class BokehPlots:
@@ -846,9 +864,10 @@ class BokehPlots:
     @staticmethod
     def _swapaxes(kwargs):
         kwargs['x_range'], kwargs['y_range'] = kwargs['y_range'], kwargs[
-                'x_range']
-        kwargs['x_axis_label'], kwargs['y_axis_label'] = kwargs['y_axis_label'], kwargs[
-                'x_axis_label']
+            'x_range']
+        kwargs['x_axis_label'], kwargs['y_axis_label'] = kwargs['y_axis_label'], \
+                                                         kwargs[
+                                                             'x_axis_label']
 
     def cpu_bars(self, vertical=True, **kwargs):
         cpus = sorted(RessourceMonitor.cpus(), key=itemgetter(0))
@@ -916,21 +935,21 @@ class BokehPlots:
             return figure(**kwargs, tools=[], title=title)
 
         p1, p2 = (makefig(name_range, Range1d(0, 100), 'load', 'GPU load', '%'),
-                  makefig(name_range, Range1d(0, max_free), 'free', 'GPU free memory', 'MiB'))
-
+                  makefig(name_range, Range1d(0, max_free), 'free',
+                          'GPU free memory', 'MiB'))
 
         if vertical:
-            p = vplot(p1,p2)
+            p = vplot(p1, p2)
             p1.quad(left='name_low', right='name_high', top='load',
-                   bottom='zeros', source=source)
+                    bottom='zeros', source=source)
             p2.quad(left='name_low', right='name_high', top='free',
-                   bottom='zeros', source=source)
+                    bottom='zeros', source=source)
         else:
-            p = hplot(p1,p2)
+            p = hplot(p1, p2)
             p1.quad(left='zeros', right='load', top='name_high',
-                   bottom='name_low', source=source)
+                    bottom='name_low', source=source)
             p2.quad(left='zeros', right='free', top='name_high',
-                   bottom='name_low', source=source)
+                    bottom='name_low', source=source)
         p1.add_tools(HoverTool(tooltips=[('load', "@load")]))
         p2.add_tools(HoverTool(tooltips=[('free', "@free")]))
         return p
@@ -948,7 +967,7 @@ class BokehPlots:
 
         source = ColumnDataSource(user2data(users))
 
-        val_range = Range1d(0, max(source.data['memusage'])*1.5)
+        val_range = Range1d(0, max(source.data['memusage']) * 1.5)
         name_range = FactorRange(factors=source.data['name'])
         kwargs['x_range'] = name_range
         kwargs['y_range'] = val_range
@@ -967,7 +986,6 @@ class BokehPlots:
         else:
             p.quad(left='zeros', right='memusage', top='name_high',
                    bottom='name_low', source=source)
-
 
         @self.change_consumer.register_waiter
         def waiter():
@@ -992,7 +1010,9 @@ class BokehPlots:
         return p
 
     def console(self, stdout=True, stderr=True, **kwargs):
-        console_kwargs = dict((key, kwargs[key]) for key in ['n', 'max_line_len', 'input_bottom'] if key in kwargs)
+        console_kwargs = dict(
+            (key, kwargs[key]) for key in ['n', 'max_line_len', 'input_bottom']
+            if key in kwargs)
 
         consoles = list()
 
@@ -1025,10 +1045,11 @@ class BokehPlots:
 
     def progress(self, job_names, **kwargs):
         job_name2idx = dict((name, i) for i, name in enumerate(job_names))
-        state2color = dict(zip(['dead', 'queued', 'init', 'running',
-                                 'complete'], reversed(RdYlGn5)))
+        state2color = dict(zip(['dead', 'queued', 'init', 'running-1',
+                                'running-2', 'running-3',
+                                'complete'], reversed(RdYlGn7)))
         source = ColumnDataSource(self._bar_source(job_names, ('percent', 0),
-                                                   ('color', RdYlGn5[1])))
+                                                   ('color', state2color['queued'])))
         p = figure(
             x_range=Range1d(0, 100), height=(100 + 30 * len(job_names)),
             width=400,
@@ -1041,20 +1062,24 @@ class BokehPlots:
         )
 
         p.quad(left='zeros', right='percent', top='name_high',
-                  bottom='name_low', fill_color='color', source=source)
+               bottom='name_low', fill_color='color', source=source)
 
         @self.change_consumer.register_waiter
         def waiter():
             change = yield JobProgress
+            print(change)
             while not self.terminated:
                 idx = job_name2idx.get(change.name, None)
-                if None:
+                if idx is None:
                     warnings.warn('unknown job!: "{}"'.format(change))
+                    continue
                 self._drop_in(source.data, 'percent', idx, change.percent)
 
                 if state2color[change.state] != source.data['color'][idx]:
-                    self._drop_in(source.data, 'color', idx, state2color[change.state])
+                    self._drop_in(source.data, 'color', idx,
+                                  state2color[change.state])
                 change = yield
+
         return p
 
     def serve(self, host='localhost', port=5006, session_id='test'):
@@ -1071,130 +1096,74 @@ def best_gpu():
     return g[0]
 
 
-class ProgressUpdater:
+class ProgressMonitor:
     def __init__(self, job_name):
         self.job_name = job_name
-        self.source = None
-        self._waiter = None
-        self.session = None
-        self.changes = OrderedDict()
-        self.console_stream = AsyncBytesIO()
+        self.change_q = ChangeStream()
+        self.plot_gen = BokehPlots(self.change_q)
+        self.ressource_mon = RessourceMonitor(self.change_q)
+        self.figures = None
         self.terminated = False
-        self.progress = OrderedDict()
-        self.loop = None
-        self.ressources = None
-        self.console = None
 
-    async def terminate(self):
+    def layout(self, job_names):
+        self.figures = vplot(hplot(self.plot_gen.progress(job_names),
+                                   vplot(
+                                       self.plot_gen.gpu_bars(vertical=True,
+                                                              height=250),
+                                       self.plot_gen.cpu_bars(vertical=False),
+
+                                       self.plot_gen.user_total_memusage(
+                                           height=400,
+                                           width=400))),
+                             self.plot_gen.console(n=50, max_line_len=80,
+                                                   input_bottom=False))
+
+    def terminate(self):
+        self.ressource_mon.terminated = True
+        self.change_q.terminated = True
+        self.change_q.put_nowait(Command('terminate', tuple(), dict()))
         self.terminated = True
-        await self.wakeup_waiter()
 
-    def init_data_source(self, progress: OrderedDict):
-        source = ColumnDataSource({
-            'progress': list(progress.values()),
-            'zeros': [0] * len(progress),
-            'prefix': list(progress.keys()),
-            'prefix_top': [p + ':0.9' for p in progress.keys()],
-            'prefix_bottom': [p + ':0.1' for p in progress.keys()]
-        })
-        return source
+    async def start(self, session_id, job_names):
+        self.layout(job_names)
+        self.plot_gen.serve(port=5010, session_id=session_id)
+        await asyncio.gather(self.ressource_mon.gpus_mon(),
+                             self.ressource_mon.cpus_mon(),
+                             self.change_q.start())
 
-    def make_plot(self):
-        source = self.source
-        prog = figure(
-            x_range=Range1d(0, 100), height=700, width=400,
-            y_range=FactorRange(factors=source.data['prefix']),
-            tools=[HoverTool(tooltips=[("job", "@prefix"),
-                                       ("progress", "@progress")])]
-        )
-        prog.quad(left='zeros', right='progress', top='prefix_top',
-                  bottom='prefix_bottom', source=source)
 
-        res = [figure(y_range=Range1d(0, max(r.data['progress'])),
-                      x_range=FactorRange(factors=r.data['prefix']),
-                      height=300, width=800,
-                      tools=[HoverTool(tooltips=[("dev", "@prefix"),
-                                                 ("value", "@progress")])]) for
-               r in self.ressources]
+class BatchSemaphore(asyncio.locks.Semaphore):
+    def __init__(self, n_locks, loop=None):
+        super().__init__(n_locks, loop=loop)
+        self.ids = deque(range(n_locks))
 
-        for fig, r in zip(res, self.ressources):
-            fig.quad(left='prefix_bottom', right='prefix_top',
-                     top='progress', bottom='zeros', source=r)
+    def __await__(self):
+        # To make "with await lock" work.
+        yield from self.acquire()
+        return IDContext(self.ids.popleft(), self)
 
-        self.console = BokehConsole(n=40, max_line_len=200, input_bottom=False)
+    async def __aenter__(self):
+        raise NotImplementedError()
 
-        """
-        res = [charts.Bar(self.ressources[1].to_df(), label='gpu_dev',
-                               values='gpu_free', height=100, width=200),
-                    charts.Bar(self.ressources[0].to_df(), label='cpu_dev',
-                               values='cpu_load', width=600)
-                    ]
-        """
+    async def __aexit__(self, exc_type, exc, tb):
+        raise NotImplementedError()
 
-        vplot(hplot(prog, vplot(*res)), self.console.p)
-        # gridplot([[prog, res[0]], [res[1]]])
-        # curdoc().add_root(hplot(prog, res))
 
-    def push(self):
-        # open a session to keep our local document in sync with server
-        self.session = push_session(curdoc(),
-                                    session_id=self.job_name,
-                                    url='http://localhost:5010/')
-        self.session.show()
+class IDContext:
+    def __init__(self, context_id, semaphore: BatchSemaphore):
+        self.id = context_id
+        self.semaphore = semaphore
 
-    async def wakeup_waiter(self):
-        waiter = self._waiter
-        if waiter is not None:
-            self._waiter = None
-            if not waiter.cancelled():
-                waiter.set_result(None)
+    async def __aenter__(self):
+        return self.id
 
-    async def wait_for_data(self):
-        if self._waiter is not None:
-            raise RuntimeError('%s() called while another coroutine is '
-                               'already waiting for incoming data')
+    def __enter__(self):
+        return self.id
 
-        self._waiter = asyncio.futures.Future(loop=self.loop)
-        try:
-            await self._waiter
-        finally:
-            self._waiter = None
+    async def __aexit__(self, exc_type, exc, tb):
+        self.semaphore.ids.append(self.id)
+        self.semaphore.release()
 
-    async def progress_updater(self):
-        while True:
-            await self.wait_for_data()
-            if not self.changes:
-                continue
-
-            self.progress.update(self.changes)
-            self.changes.clear()
-            self.source.data['progress'] = list(self.progress.values())
-
-    async def ressource_updater(self):
-        while True:
-            self.ressources[0].data['progress'] = [g.free for g in
-                                                   await gpus_coro()]
-            self.ressources[1].data['progress'] = [c.load for c in
-                                                   await cpus_coro()]
-            await asyncio.sleep(2.5)
-
-    async def console_updater(self):
-        console = self.console
-        assert isinstance(console, BokehConsole)
-        while True:
-            data = await self.console_stream.readline()
-            console.output_text(data.decode())
-
-    async def start(self, progress, loop):
-        self.loop = loop
-        self.source = self.init_data_source(progress)
-        gpu = OrderedDict(('GPU {0}'.format(g.dev), g.free) for g in gpus())
-        cpu = OrderedDict(('CPU {0}'.format(g.dev), g.load) for g in cpus())
-        self.ressources = (
-            self.init_data_source(gpu), self.init_data_source(cpu))
-        # self.init_ressource_source()
-        self.progress = progress
-        self.make_plot()
-        self.push()
-        await asyncio.gather(self.progress_updater(), self.ressource_updater(),
-                             self.console_updater())
+    def __exit__(self, exc_type, exc, tb):
+        self.semaphore.ids.append(self.id)
+        self.semaphore.release()

@@ -4,33 +4,40 @@ For orchestrating the lasagna making process
 # builtins
 import os
 import tempfile
+import warnings
 from asyncio.subprocess import PIPE
 from collections import (namedtuple, OrderedDict, defaultdict, deque)
+from functools import partial
 from typing import List
-
+import re
 import asyncio
-import numpy as np
+from aiohttp import web
+import zipfile
+import atexit
 
+# pip
+import numpy as np
+import tqdm
+import theano
 
 # github packages
-import theano
-import tqdm
-
 from elymetaclasses.abc import io as ioabc
 
 # relative
-from .utils import any_to_stream, pbar, best_gpu
+from .utils import any_to_stream, pbar, best_gpu, ProgressMonitor, ChangeStream, \
+    JobProgress, async_subprocess, BatchSemaphore
 from .recipe import LasagneBase
-from .oven import BufferedBatchGenerator, CharmappedBatchGenerator, FullArrayBatchGenerator
+from .oven import BufferedBatchGenerator, CharmappedBatchGenerator, \
+    FullArrayBatchGenerator
 from .fridge import ClassSaveLoadMixin, TupperWare
 from .menu import Options
+
 
 class BaseCook(ClassSaveLoadMixin):
     def __init__(self, opt: Options,
                  oven: FullArrayBatchGenerator,
                  recipe: LasagneBase,
                  fridge):
-
         self.opt = opt
         self.oven = oven
         self.recipe = recipe
@@ -53,7 +60,8 @@ class BaseCook(ClassSaveLoadMixin):
         Actions to be taken before we put everything in the fridge
         :return:
         """
-        self.fridge.shelves['recipe']['all_params'] = self.recipe.all_params
+        self.fridge.shelves['recipe'][
+            'all_params'] = self.recipe.get_all_params_copy()
 
     def to_dict(self):
         self.close_shop()
@@ -86,73 +94,94 @@ class LasagneTrainer(CharmapCook):
             yield self.recipe.f_train_noreturn(x, y)
 
     def train_err(self, batches):
-        for x, y in self.oven.iter_batch(batches):
+        for x, y in self.oven.iter_batch(batches, part='train'):
+            yield self.recipe.f_cost(x, y)
+
+    def val(self, epochs):
+        for x, y in self.oven.iter_epoch(epochs, part='val'):
             yield self.recipe.f_cost(x, y)
 
     def test(self, epochs):
         for x, y in self.oven.iter_epoch(epochs, part='test'):
             yield self.recipe.f_cost(x, y)
 
-    def auto_train(self):
+    def auto_train(self, pbar=pbar):
         required_opt = ('start_epochs', 'decay_epochs')
+        print(self.val(1))
         if any(o not in self.opt for o in required_opt):
             raise ValueError('Options missing. Need {}'.format(required_opt))
 
         s_ep = self.opt.start_epochs
         print('Start train {} epochs\n'.format(s_ep))
 
-        pb, msg = pbar('batches', s_ep * self.oven.batches_per_epoch.train, '')
-        pb.start()
-        for _ in pb(self.train(s_ep)):
-            pass
 
-        train_err_batches = self.oven.batches_per_epoch.train // 4
-        test_err_hist = list(self.test(1))
+
+        train_err_batches = self.oven.batches_per_epoch.train
+        val_err_hist = list(self.val(1))
         train_err_hist = list(self.train_err(train_err_batches))
         l1 = len(train_err_hist)
-        l2 = len(test_err_hist)
-        te_err = np.mean(test_err_hist[-l2:])
+        l2 = len(val_err_hist)
+        te_err = np.mean(val_err_hist[-l2:])
         tr_err = np.mean(train_err_hist[-l1:])
+        message = lambda te, tr: 'te: {0:1.3f} tr: {1:1.3f}'.format(te, tr)
+        pb, msg = pbar('batches', s_ep * train_err_batches, message(te_err, tr_err))
+        pb.start()
 
-        message = lambda te, tr: 'tr: {0:1.2f} te: {1:1.2f}'.format(te, tr)
-        MEM = 5
-        params = deque([np.copy(self.recipe.all_params)])    #BytesIO() for _ in range(MEM))
-        test_err = deque([np.mean(test_err_hist)])  #10.0**10 for _ in range(MEM))
+        for j in range(self.opt.start_epochs):
+            for _ in self.train(1):
+                pb.update(pb.currval + 1)
+
+            train_err_hist.extend(self.train_err(s_ep * train_err_batches))
+            val_err_hist.extend(self.val(1))
+            te_err = np.mean(val_err_hist[-l2:])
+            tr_err = np.mean(train_err_hist[-l1:])
+            msg.message = message(te_err, tr_err)
+        pb.finish()
+        # // 4
+        val_err_hist = list(self.val(1))
+        train_err_hist = list(self.train_err(train_err_batches))
+
+        MEM = 10
+        params = deque([
+            self.recipe.get_all_params_copy()])  # BytesIO() for _ in range(MEM))
+        val_err = deque(
+            [np.mean(val_err_hist)])  # 10.0**10 for _ in range(MEM))
 
         pb, msg = pbar('epochs', self.opt.decay_epochs, message(te_err, tr_err))
         for _i in pb(range(self.opt.decay_epochs)):
             i = _i + 1
             try:
                 for _ in self.train(1):
+                    #print(_)
                     pass
 
                 train_err_hist.extend(self.train_err(train_err_batches))
-                test_err_hist.extend(self.test(1))
-                te_err = np.mean(test_err_hist[-l2:])
+                val_err_hist.extend(self.val(1))
+                te_err = np.mean(val_err_hist[-l2:])
                 tr_err = np.mean(train_err_hist[-l1:])
-                message(te_err, tr_err)
+                msg.message = message(te_err, tr_err)
 
             except KeyboardInterrupt:
                 break
 
             # build or rotate deque
             if i < MEM:
-                params.appendleft(np.copy(self.recipe.all_params))
-                test_err.appendleft(te_err)
+                params.appendleft(self.recipe.get_all_params_copy())
+                val_err.appendleft(te_err)
             else:
                 params.rotate()
-                test_err.rotate()
+                val_err.rotate()
 
-            min_test_err = np.min(test_err)
+            min_test_err = np.min(val_err)
             # store or discard
-            if min_test_err >= te_err: # current error is as good or better than all previous
+            if min_test_err >= te_err:  # current error is as good or better than all previous
                 # store
-                params[0] = np.copy(self.recipe.all_params)
-                test_err[0] = te_err
+                params[0] = self.recipe.get_all_params_copy()
+                val_err[0] = te_err
 
-            elif min_test_err == test_err[0]: # oldest model is best. stop
+            elif min_test_err == val_err[0]:  # oldest model is best. stop
                 # give up
-                print('Early stopping..', test_err)
+                print('Early stopping..', val_err)
                 break
             else:
                 # discard
@@ -160,11 +189,39 @@ class LasagneTrainer(CharmapCook):
         else:
             print('Did not find a minimum. Stopping')
 
-        idx_best = np.argmax(test_err)
-        print('Stopped training. choosing {}'.format(idx_best), test_err)
+        pb.finish()
+        idx_best = np.argmin(val_err)
+        print('Stopped training. choosing model #{} -> '.format(idx_best),
+              val_err)
         self.recipe.set_all_params(params[idx_best])
-        self.box['test_error_hist'] = test_err_hist
+        self.box['params'] = params[idx_best]
+        self.box['val_error_hist'] = val_err_hist
         self.box['train_error_hist'] = train_err_hist
+
+
+class LearningRateMixin:
+    def __init__(self, *args, **kwargs):
+        self._epochs = 0
+        super().__init__(*args, **kwargs)
+
+    def train(self, epochs) -> List[None]:
+        step = max(self._epochs - self.recipe.opt.start_epochs, 0)
+
+        for x, y in self.oven.iter_epoch(epochs, part='train'):
+            yield self.recipe.f_train_noreturn(step=step)(x, y)
+        self._epochs += epochs
+
+    def train_err(self, batches):
+        for x, y in self.oven.iter_batch(batches, part='train'):
+            yield self.recipe.f_cost(x, y)
+
+    def val(self, epochs):
+        for x, y in self.oven.iter_epoch(epochs, part='val'):
+            yield self.recipe.f_cost(x, y)
+
+    def test(self, epochs):
+        for x, y in self.oven.iter_epoch(epochs, part='test'):
+            yield self.recipe.f_cost(x, y)
 
 
 class AsyncHeadChef(LasagneTrainer):
@@ -176,10 +233,12 @@ class AsyncHeadChef(LasagneTrainer):
         self.startup_lock = asyncio.locks.Lock(loop=self.loop)
         self.semaphore = None
         self.basemodel_path = None
-        self.processes = list()
+        self.progress_mon = ProgressMonitor('test')
+        self.active_procs = list()
 
     def make_feature_net(self, **features):
-        feature_name, feature_list = features.popitem()
+        feature_name = sorted(features.keys())[0]
+        feature_list = features.pop(feature_name)
         for feature in feature_list:
             res = [(feature_name, feature)]
             if not features:
@@ -189,44 +248,115 @@ class AsyncHeadChef(LasagneTrainer):
             for iter_res in self.make_feature_net(**features):
                 yield res + iter_res
 
-    def featurenet_train(self, out_dir, concurrent=5, **features):
+    def featurenet_train(self, out_dir, session_id, concurrent=3, **features):
         try:
             os.mkdir(out_dir)
         except IOError:
             pass
 
-        self.fridge.save(out_dir + os.sep + 'basemodel.lfr' )
-        fd_bm, self.basemodel_path = tempfile.mkstemp(suffix='.lrf', prefix='basemodel',
-                                              dir=os.path.abspath('.'))
+        self.fridge.save(out_dir + os.sep + 'basemodel.lfr')
+        fd_bm, self.basemodel_path = tempfile.mkstemp(suffix='.lrf',
+                                                      prefix='basemodel',
+                                                      dir=os.path.abspath('.'))
+        with open(fd_bm, 'wb') as fp:
+            self.fridge.save(fp)
+        atexit.register(partial(os.remove, self.basemodel_path))
+
+        self.semaphore = BatchSemaphore(concurrent)
+        override_combinations = list(self.make_feature_net(**dict(features)))
+        to_do = [self.train_model(overrides, out_dir) for overrides
+                 in override_combinations]
+
+        job_names = [self.prefix_from_overrides(o) for o in
+                     override_combinations]
+
         try:
-            self.fridge.save(fd_bm)
+            with self.progress_mon.change_q.redirect_stdout(copy=True):
+                with self.progress_mon.change_q.redirect_stderr(copy=True):
+                    coros = asyncio.gather(self.progress_mon.start(session_id,
+                                                                   job_names),
+                                           self.trainer_coro(to_do))
+                    self.loop.run_until_complete(coros)
+                    self.loop.close()
         finally:
-            fd_bm.close()
+            self.terminate()
 
-        total = sum(len(val) for val in features.values())
-        self.semaphore = asyncio.Semaphore(concurrent)
-        to_do = (self.train_model(overrides, out_dir) for overrides
-                                 in self.make_feature_net(**dict(features)))
-        self.loop.run_until_complete(self.trainer_coro(to_do, total))
-        self.loop.close()
+    def terminate(self):
+        while self.active_procs:
+            proc = self.active_procs.pop()
+            assert isinstance(proc, asyncio.subprocess.Process)
+            try:
+                proc.terminate()
+                proc.kill()
+            except:
+                pass
 
-    async def trainer_coro(self, to_do, total):
+        if not self.progress_mon.terminated:
+            self.progress_mon.terminate()
+
+    async def trainer_coro(self, to_do):
+        n = len(to_do)
         to_do_iter = asyncio.as_completed(to_do)
-        to_do_iter = tqdm.tqdm(to_do_iter, total=total)
-
+        to_do_iter = tqdm.tqdm(to_do_iter, total=n)
+        i = 0
         for future in to_do_iter:
             await future
+            i += 1
+        self.progress_mon.terminate()
 
-    async def train_model(self, overrides, out_dir):
-        prefix = '_'.join('-'.join(override for override in overrides))
-        fname = prefix + '.lfr'
+    async def write_to_log(self, stream: asyncio.streams.StreamReader,
+                           logfile: ioabc.OutputStream,
+                           prefix):
+        pbar_regx = re.compile(b'(\d+)%\ ?\|#+')
+        state = 1
+        while True:
+            # print('waiting on ' + prefix)
+            data = await stream.readline()  # this should be bytes
+            # print('read {} bytes'.format(len(data)))
+            if not data and stream.at_eof():
+                # print('breaking')
+                break
 
-        with await self.semaphore:
+            for percent in [int(percent) for percent in pbar_regx.findall(data)]:
+                self.job_progress(prefix, percent,
+                                  'running-{}'.format(state))
+                if percent == 100:
+                    state += 1
+            logfile.write(data.decode())
+
+    def job_progress(self, prefix, percent, stage):
+        self.progress_mon.change_q.put_nowait(
+            JobProgress(prefix, percent, stage))
+
+    @staticmethod
+    def prefix_from_overrides(overrides):
+        return '_'.join(
+            '{0}-{1:2.0f}'.format(key, val * 100 if val <= 1 else val) for key, val in overrides)
+
+    async def train_model(self, overrides, out_dir, overwrite=False):
+        prefix = self.prefix_from_overrides(overrides)
+        fname = out_dir + os.sep + prefix + '.lfr'
+        if os.path.isfile(fname) and not overwrite:
+            warnings.warn('{} already exist'.format(fname))
+            try:
+                zipfile.ZipFile(fname)
+            except zipfile.BadZipFile:
+                warnings.warn('not a valid zip file -> overwrite'.format(fname))
+            else:
+                warnings.warn('Skipping...')
+                return
+
+        with (await self.semaphore) as sem_id:
+            self.job_progress(prefix, 33, 'init')
             # get a compiledir
-            comp_dir = self.compiled_base_dir + '/semaphore-1-' + str(self.semaphore._value)
+            comp_dir = self.compiled_base_dir + '/semaphore-1-' + str(
+                sem_id)
 
-            with open(prefix + '.log', 'wb', buffering=1) as logfile:
+            with open(out_dir + os.sep + prefix + '.log', 'w',
+                      buffering=1) as logfile:
                 with await self.startup_lock:
+                    self.job_progress(prefix, 66, 'init')
+
                     # find best gpu. Wait if no suitable gpu exists
                     gpu = best_gpu()
                     while gpu.free < 2000:
@@ -236,7 +366,8 @@ class AsyncHeadChef(LasagneTrainer):
 
                     # define environment
                     _env = dict(os.environ)
-                    _env['THEANO_FLAGS'] = 'base_compiledir={0},device=gpu{1}'.format(comp_dir, gpu.dev)
+                    _env['THEANO_FLAGS'] = 'base_compiledir={0},device=gpu{1}'.format(
+                        comp_dir, gpu.dev)
 
                     # make sure compiledir exists
                     try:
@@ -245,39 +376,80 @@ class AsyncHeadChef(LasagneTrainer):
                         pass
 
                     # Start up a worker
-                    print('Started on ' + prefix + ' using ' + _env['THEANO_FLAGS'])
+                    print('Started on ' + prefix + ' using ' + _env[
+                        'THEANO_FLAGS'] + '\n')
+                    self.job_progress(prefix, 80, 'init')
 
-                    p = await asyncio.create_subprocess_exec('mypython3', '-i',
-                                                             self.basemodel_path,
-                                                             stdout=logfile,
-                                                             stderr=logfile,
-                                                             stdin=PIPE,
-                                                             env=_env)
-                    assert isinstance(p, asyncio.subprocess.Process)
-                    self.processes.append(p)
+                    p = await async_subprocess('mypython3', '-i',
+                                               self.basemodel_path,
+                                               stdout=PIPE,
+                                               stderr=PIPE,
+                                               stdin=PIPE,
+                                               env=_env)
+
+                    self.active_procs.append(p.p)
                     stdin = p.stdin
                     assert isinstance(stdin, asyncio.streams.StreamWriter)
 
+                    def wrap(lines) -> bytes:
+                        cmd = b'import sys;return_code = 1;'
+                        cmd += b';'.join(lines)
+                        cmd += b';return_code = 0\n'
+                        return cmd
+
+                    lines = [b'print("setting opts")']
                     # send commands to worker to change features
                     for feature_name, value in overrides:
-                        stdin.write('obj.opt.{0} = {1}\n'.format(feature_name, value))
-                    await stdin.drain()
-
+                        lines.append('obj.opt.{0} = {1}'.format(feature_name,
+                                                                value).encode())
+                    lines.append(b'sys.stdout.write(str(obj.opt))')
+                    lines.append(b'del obj.recipe.saved_params')
                     # startup the training
-                    stdin.write('obj.auto_train()\nobj.save({0})'.format(fname))
+                    lines.append(b'obj.cook.auto_train()')
+                    lines.append('obj.save("{0}")'.format(fname).encode())
+
+                    # call sys exit so process will terminate
+                    #stdin.write('sys.exit(0)\n'.format(fname).encode())
+
+                    cmd = wrap(lines)
+                    lines = []
+                    #for l in cmd.split(b'\n'):
+                    #    stdin.write(l + b'\n')
+                    stdin.write(cmd)
+                    stdin.write(b'print("return_code: ", return_code)\n')
+                    stdin.write(b'sys.exit(return_code)\n')
+                    logfile.write(cmd.decode())
+                    logfile.flush()
                     await stdin.drain()
 
-                    # close stream so process will terminate
-                    stdin.close()
+                    # stdin.close()
 
                     # wait some time for the worker to actually start using the
                     # GPU before releasing startup lock
-                    await asyncio.sleep(20)  # wait some time to release lock
+                    for i in range(20):
+                        await asyncio.sleep(1)  # wait some time to release lock
+                        self.job_progress(prefix, 80 + i, 'init')
                 # startup lock released here
 
-                await p.wait()
-                self.processes.remove(p)
-            print('Completed ' + fname)
+                to_do = [self.write_to_log(p.stdout, logfile, prefix),
+                         self.write_to_log(p.stderr, logfile, prefix),
+                         p.p.wait()]
+                await asyncio.gather(*to_do, loop=self.loop)
+                self.active_procs.remove(p.p)
+                if p.p.returncode == 0:
+                    self.job_progress(prefix, 100, 'complete')
+                    print('Completed ' + fname)
+                else:
+                    self.job_progress(prefix, 100, 'dead')
+                    warnings.warn('job "{0}" ended with returncode {1}'.format(prefix, p.p.returncode))
+
+    def __del__(self):
+        self.terminate()
+
+
+class AsyncHCLearningRate(LearningRateMixin, AsyncHeadChef):
+    pass
+
 
 """
 import asyncio

@@ -9,12 +9,14 @@ from functools import (lru_cache, partial)
 from theano import tensor as T
 import theano
 import lasagne as L
+import numpy as np
 
 # github packages
 from elymetaclasses.events import ChainedProps, args_from_opt
+from .utils import ChainPropsABCMetaclass
+from .fridge import ClassSaveLoadMixin
 
-
-class LasagneBase(ChainedProps):
+class LasagneBase(ChainedProps, ClassSaveLoadMixin, metaclass=ChainPropsABCMetaclass):
     @property
     def l_in(self, seq_len, features, win_sz=1):
         """
@@ -75,22 +77,49 @@ class LasagneBase(ChainedProps):
         return L.layers.ReshapeLayer(self.l_out_flat, (-1, seq_len, features))
 
     @property
+    def saved_params(self):
+        """
+        A property to hold saved parameters that should be used to initialize
+        :return: None by default. But will can be set by a cook at .open_shop()
+        if any aparams exists in in the recipe tupperware
+        """
+        return None
+
+    def init_params(self, saved_params):
+        if saved_params:
+            self.set_all_params(saved_params)
+
+    @property
     def all_params(self):
         """
         list of shared variables which hold all parameters in the lasagne
         :return:
         """
+        self.init_params(self.saved_params)
         return L.layers.get_all_params(self.l_out_flat)
 
     @property
-    def cost(self, features):
+    def all_train_params(self):
+        self.init_params(self.saved_params)
+        return L.layers.get_all_params(self.l_out_flat)
+
+    def set_all_params(self, params):
+        params = [np.array(param, dtype=np.float32) for param in params]
+        L.layers.set_all_param_values(self.l_out_flat, params)
+        self.saved_params = params
+
+    def get_all_params_copy(self):
+        return L.layers.get_all_param_values(self.l_out_flat)
+
+    @property
+    def cost(self):
         """
         Shared variable with the cost of target values vs predicted values
-        :param features:
+        :param:
         :return:
         """
         flattened_output = L.layers.get_output(self.l_out_flat)
-        return self.cost_metric(flattened_output, features)
+        return self.cost_metric(flattened_output)
 
     @property
     def cost_det(self):
@@ -108,11 +137,25 @@ class LasagneBase(ChainedProps):
     def f_train(self):
         """
         Compiled theano function that takes (x, y) and trains the lasagne
+        Updates use default cost (e.g with dropout)
+        But f_train return the deterministic cost
         :return:
         """
-        updates = L.updates.rmsprop(self.cost, self.all_params)
+        updates = L.updates.rmsprop(self.cost, self.all_train_params, .002)
         return theano.function([self.l_in.input_var, self.target_values],
-                               self.cost,
+                               self.cost_det,
+                               updates=updates, allow_input_downcast=True)
+
+    @property
+    def f_train_noreturn(self):
+        """
+        Compiled theano function that takes (x, y) and trains the lasagne
+        Updates use default cost (e.g with dropout)
+        Does *not* return a cost.
+        :return: None
+        """
+        updates = L.updates.rmsprop(self.cost, self.all_train_params, .002)
+        return theano.function([self.l_in.input_var, self.target_values], self.cost,
                                updates=updates, allow_input_downcast=True)
 
     @property
@@ -149,14 +192,12 @@ class LasagneBase(ChainedProps):
         """
         apply a metric of cost to flattened output with given number of features
         :param flattened_output:
-        :param features:
         :return:
         """
         raise NotImplementedError
 
 
 class LSTMBase(LasagneBase):
-
     @args_from_opt(1)
     def build_lstm_layers(self, l_prev, n_hid_unit, n_hid_lay):
         """
@@ -201,19 +242,21 @@ class LSTMBase(LasagneBase):
     def l_out(self, seq_len, features):
         return L.layers.ReshapeLayer(self.l_out_flat, (-1, seq_len, features))
 
-    @property
-    def all_params(self, W_range=0.08):
+    @args_from_opt(1)
+    def init_params(self, saved_params, W_range=0.08):
         """
         initialize all parameters to uniform in +-W_range
         :param W_range:
         :return:
         """
-        all_params = L.layers.get_all_params(self.l_out_flat)
-        w_init = L.init.Uniform(range=W_range)
-        for param in all_params:
-            w = param.get_value()
-            w[:] = w_init.sample(w.shape)
-        return all_params
+        if saved_params:
+            super().init_params(saved_params)
+        else:
+            w_init = L.init.Uniform(range=W_range)
+            new_params = [w_init.sample(w.shape) for w
+                          in self.get_all_params_copy()]
+
+            self.set_all_params(new_params)
 
     @args_from_opt(1)
     def cost_metric(self, flattened_output, features):
@@ -224,7 +267,7 @@ class LSTMBase(LasagneBase):
         :return:
         """
         return T.nnet.categorical_crossentropy(flattened_output,
-                                               self.target_values.reshape2xy_batch_chunk(
+                                               self.target_values.reshape(
                                                        (-1, features))).mean()
 
 
@@ -238,14 +281,14 @@ class LearningRateMixin(LasagneBase):
         :return:
         """
         alphaVar = T.fscalar()
-        updates = L.updates.rmsprop(self.cost, self.all_params, alphaVar, decay)
+        updates = L.updates.rmsprop(self.cost, self.all_train_params, alphaVar)
         return theano.function(
                 [alphaVar, self.l_in.input_var, self.target_values], self.cost,
                 updates=updates, allow_input_downcast=True)
 
     @lru_cache()
     @args_from_opt(2)
-    def f_train(self, alpha=None, step=None, start_alpha=(2 * 10 ** (-3)), alpha_factor=.95):
+    def f_train_noreturn(self, alpha=None, step=None, start_alpha=(2 * 10 ** (-3)), alpha_factor=.95):
         """
         produce wrapped f_train_alpha.
         wrapped f_train can be called without alpha parameter
@@ -256,7 +299,7 @@ class LearningRateMixin(LasagneBase):
         f = self.f_train_alpha
         if alpha is None:
             alpha = start_alpha * alpha_factor ** step
-
+        print("learning rate: " + str(alpha))
         return partial(f, alpha)
 
 
@@ -272,3 +315,23 @@ class DropoutInOutMixin(LasagneBase):
     @property
     def l_top(self):
         return self.apply_dropout(super().l_top)
+
+
+
+class LSTMDropout(DropoutInOutMixin, LSTMBase):
+    pass
+
+
+class LSTMDropoutIn(DropoutInOutMixin, LSTMBase, LearningRateMixin):
+    @property
+    def l_top(self):
+        return super(DropoutInOutMixin, self).l_top
+
+
+
+class LSTMDropoutLR(DropoutInOutMixin, LearningRateMixin, LSTMBase):
+    @property
+    def f_grad(self):
+        g = theano.grad(self.cost, self.all_params)
+        return theano.function([self.l_in.input_var, self.target_values],
+                               [self.cost] + g, allow_input_downcast=True)
