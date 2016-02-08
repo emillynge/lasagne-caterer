@@ -131,15 +131,15 @@ class LasagneTrainer(CharmapCook):
             for _ in self.train(1):
                 pb.update(pb.currval + 1)
 
-            train_err_hist.extend(self.train_err(s_ep * train_err_batches))
+            train_err_hist.extend(self.train_err(train_err_batches))
             val_err_hist.extend(self.val(1))
             te_err = np.mean(val_err_hist[-l2:])
             tr_err = np.mean(train_err_hist[-l1:])
             msg.message = message(te_err, tr_err)
         pb.finish()
         # // 4
-        val_err_hist = list(self.val(1))
-        train_err_hist = list(self.train_err(train_err_batches))
+        #val_err_hist = list(self.val(1))
+        #train_err_hist = list(self.train_err(train_err_batches))
 
         MEM = 10
         params = deque([
@@ -237,7 +237,9 @@ class AsyncHeadChef(LasagneTrainer):
         self.active_procs = list()
 
     def make_feature_net(self, **features):
-        feature_name = sorted(features.keys())[0]
+        feature_name = sorted(features.keys())[0]   # sort alphabetically
+        feature_name = sorted(feature_name,  # sort number of possible values
+                              key=lambda k: len(features[k]))[0]
         feature_list = features.pop(feature_name)
         for feature in feature_list:
             res = [(feature_name, feature)]
@@ -426,9 +428,9 @@ class AsyncHeadChef(LasagneTrainer):
 
                     # wait some time for the worker to actually start using the
                     # GPU before releasing startup lock
-                    for i in range(20):
+                    for i in range(40):
                         await asyncio.sleep(1)  # wait some time to release lock
-                        self.job_progress(prefix, 80 + i, 'init')
+                        self.job_progress(prefix, 60 + i, 'init')
                 # startup lock released here
 
                 to_do = [self.write_to_log(p.stdout, logfile, prefix),

@@ -63,7 +63,7 @@ class LasagneBase(ChainedProps, ClassSaveLoadMixin, metaclass=ChainPropsABCMetac
         (eg. softmax into classes)
         :return:
         """
-        return self.nonlin_out(self.l_top)
+        return self.out_transform(self.l_top)
 
     @property
     def l_out(self, seq_len, features):
@@ -101,7 +101,7 @@ class LasagneBase(ChainedProps, ClassSaveLoadMixin, metaclass=ChainPropsABCMetac
     @property
     def all_train_params(self):
         self.init_params(self.saved_params)
-        return L.layers.get_all_params(self.l_out_flat)
+        return L.layers.get_all_params(self.l_out_flat, trainable=True)
 
     def set_all_params(self, params):
         params = [np.array(param, dtype=np.float32) for param in params]
@@ -215,7 +215,7 @@ class LSTMBase(LasagneBase):
         return l_prev
 
     @args_from_opt(1)
-    def nonlin_out(self, l_prev, n_hid_unit, features):
+    def out_transform(self, l_prev, n_hid_unit, features):
         """
         Apply non-linear transform to l_prev
         :param l_prev:
@@ -226,6 +226,7 @@ class LSTMBase(LasagneBase):
         l_shp = L.layers.ReshapeLayer(l_prev, (-1, n_hid_unit))
         return L.layers.DenseLayer(l_shp, num_units=features,
                                    nonlinearity=L.nonlinearities.softmax)
+
     @property
     def l_top(self):
         """
@@ -233,14 +234,6 @@ class LSTMBase(LasagneBase):
         :return:
         """
         return self.build_lstm_layers(self.l_bottom)
-
-    @property
-    def l_out_flat(self):
-        return self.nonlin_out(self.l_top)
-
-    @property
-    def l_out(self, seq_len, features):
-        return L.layers.ReshapeLayer(self.l_out_flat, (-1, seq_len, features))
 
     @args_from_opt(1)
     def init_params(self, saved_params, W_range=0.08):
@@ -303,35 +296,39 @@ class LearningRateMixin(LasagneBase):
         return partial(f, alpha)
 
 
-class DropoutInOutMixin(LasagneBase):
+class DropoutMixin:
     @args_from_opt(1)
     def apply_dropout(self, l_prev, dropout=.5):
         return L.layers.DropoutLayer(l_prev, p=dropout)
 
+
+class DropoutInMixin(DropoutMixin):
     @property
-    def l_bottom(self):
-        return self.apply_dropout(super().l_bottom)
+    def l_bottom(self, dropout_in=None):
+        if dropout_in is not None:
+            return self.apply_dropout(super().l_bottom, dropout=dropout_in)
+        else:
+            return self.apply_dropout(super().l_bottom)
 
+
+class DropoutOutMixin(DropoutMixin):
     @property
-    def l_top(self):
-        return self.apply_dropout(super().l_top)
+    def l_top(self, dropout_out=None):
+        if dropout_out is not None:
+            return self.apply_dropout(super().l_bottom, dropout=dropout_out)
+        else:
+            return self.apply_dropout(super().l_bottom)
 
 
-
-class LSTMDropout(DropoutInOutMixin, LSTMBase):
+class LSTMDropout(LSTMBase, DropoutInMixin, DropoutOutMixin):
     pass
 
 
-class LSTMDropoutIn(DropoutInOutMixin, LSTMBase, LearningRateMixin):
-    @property
-    def l_top(self):
-        return super(DropoutInOutMixin, self).l_top
-
-
-
+"""
 class LSTMDropoutLR(DropoutInOutMixin, LearningRateMixin, LSTMBase):
     @property
     def f_grad(self):
         g = theano.grad(self.cost, self.all_params)
         return theano.function([self.l_in.input_var, self.target_values],
                                [self.cost] + g, allow_input_downcast=True)
+"""

@@ -562,7 +562,7 @@ class RessourceMonitor:
             self.nv2cuda_coro(subproc_exec),
             self.pid2owner_coro(subproc_exec))
 
-        p = await self.async_exec('nvidia-smi', '-l', '1',
+        p = await self.async_exec('nvidia-smi', '-l', '2',
                                   stdout=asyncio.subprocess.PIPE,
                                   stderr=FNULL)
 
@@ -637,7 +637,7 @@ class RessourceMonitor:
 
     async def cpus_mon(self):
         subproc_exec = self.async_exec
-        p = await subproc_exec('top', '-b', '-p0',
+        p = await subproc_exec('top', '-b', '-p0', '-d3',
                                stdout=PIPE)
         cpus = dict()
         while not self.terminated:
