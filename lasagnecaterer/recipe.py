@@ -296,7 +296,7 @@ class LearningRateMixin(LasagneBase):
         return partial(f, alpha)
 
 
-class DropoutMixin:
+class DropoutMixin(ChainedProps):
     @args_from_opt(1)
     def apply_dropout(self, l_prev, dropout=.5):
         return L.layers.DropoutLayer(l_prev, p=dropout)
@@ -315,12 +315,12 @@ class DropoutOutMixin(DropoutMixin):
     @property
     def l_top(self, dropout_out=None):
         if dropout_out is not None:
-            return self.apply_dropout(super().l_bottom, dropout=dropout_out)
+            return self.apply_dropout(super().l_top, dropout=dropout_out)
         else:
-            return self.apply_dropout(super().l_bottom)
+            return self.apply_dropout(super().l_top)
 
 
-class LSTMDropout(LSTMBase, DropoutInMixin, DropoutOutMixin):
+class LSTMDropout(DropoutInMixin, DropoutOutMixin, LSTMBase):
     pass
 
 

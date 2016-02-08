@@ -237,7 +237,7 @@ class AsyncHeadChef(LasagneTrainer):
         self.active_procs = list()
 
     def make_feature_net(self, **features):
-        feature_name = sorted(features.keys())[0]   # sort alphabetically
+        feature_name = sorted(features.keys())   # sort alphabetically
         feature_name = sorted(feature_name,  # sort number of possible values
                               key=lambda k: len(features[k]))[0]
         feature_list = features.pop(feature_name)
