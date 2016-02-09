@@ -333,7 +333,7 @@ class AsyncHeadChef(LasagneTrainer):
     @staticmethod
     def prefix_from_overrides(overrides):
         return '_'.join(
-            '{0}-{1:2.0f}'.format(key, val * 100 if val <= 1 and isinstance(val,
+            '{0}-{1:02.0f}'.format(key, val * 100 if val <= 1 and isinstance(val,
                                                                             float) else val)
             for key, val in overrides)
 
@@ -348,6 +348,7 @@ class AsyncHeadChef(LasagneTrainer):
                 warnings.warn('not a valid zip file -> overwrite'.format(fname))
             else:
                 warnings.warn('Skipping...')
+                self.job_progress(prefix, 100, 'complete')
                 return
 
         with (await self.semaphore) as sem_id:
