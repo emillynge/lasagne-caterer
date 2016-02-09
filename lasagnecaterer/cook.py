@@ -140,6 +140,7 @@ class LasagneTrainer(CharmapCook):
         # val_err_hist = list(self.val(1))
         # train_err_hist = list(self.train_err(train_err_batches))
 
+        perf_tol = self.opt.get('perf_tol', 0.0)
         MEM = 10
         params = deque([
             self.recipe.get_all_params_copy()])  # BytesIO() for _ in range(MEM))
@@ -171,20 +172,28 @@ class LasagneTrainer(CharmapCook):
                 params.rotate()
                 val_err.rotate()
 
-            min_test_err = np.min(val_err)
+            min_val_err = np.min(val_err)
+
+            oldest_val_err = val_err[0]
+
             # store or discard
-            if min_test_err >= te_err:  # current error is as good or better than all previous
+            if min_val_err >= te_err:  # current error is as good or better than all previous
                 # store
                 params[0] = self.recipe.get_all_params_copy()
                 val_err[0] = te_err
 
-            elif min_test_err == val_err[0]:  # oldest model is best. stop
+            elif min_val_err == val_err[0]:  # oldest model is best. stop
                 # give up
                 print('Early stopping..', val_err)
                 break
-            else:
-                # discard
-                pass
+
+            # check if we are making progress
+            # oldest model should have perf_tol worse performance PER STEP
+            # than current best
+            if perf_tol and (oldest_val_err * (1 - perf_tol) ** len(val_err) < min_val_err):
+                print('Early stopping..', val_err)
+                break
+
         else:
             print('Did not find a minimum. Stopping')
 
@@ -362,11 +371,8 @@ class AsyncHeadChef(LasagneTrainer):
                 self.job_progress(prefix, 66, 'init')
 
                 # find best gpu. Wait if no suitable gpu exists
-                try:
-                    gpu = await self.progress_mon.best_gpu()
-                except Exception as e:
-                    print(e)
-                    raise
+                gpu = await self.progress_mon.best_gpu()
+
 
                 # define environment -> set execution on specific GPU
                 _env = dict(os.environ)
@@ -380,8 +386,9 @@ class AsyncHeadChef(LasagneTrainer):
                     pass
 
                 # Start up a worker
-                print('Started on ' + prefix + ' using ' + _env[
-                    'THEANO_FLAGS'] + '\n')
+                print('Started on {0} using'
+                      ' ENV={1} and {2}'.format(prefix, _env['THEANO_FLAGS'],
+                                                gpu))
                 self.job_progress(prefix, 80, 'init')
 
                 p = await async_subprocess('mypython3', '-i',

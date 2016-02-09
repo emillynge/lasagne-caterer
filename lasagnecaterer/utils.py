@@ -1296,8 +1296,6 @@ class ProgressMonitor:
             gpu_wmean = self.gpus_wmean[new_meas.dev]
             best = get_best(best, gpu_wmean)
 
-        print(self.gpus_wmean)
-        print('best', best)
         return best
 
     def layout(self, job_names):
