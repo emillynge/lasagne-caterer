@@ -14,6 +14,7 @@ import asyncio
 from aiohttp import web
 import zipfile
 import atexit
+from datetime import datetime
 
 # pip
 import numpy as np
@@ -31,6 +32,7 @@ from .oven import BufferedBatchGenerator, CharmappedBatchGenerator, \
     FullArrayBatchGenerator
 from .fridge import ClassSaveLoadMixin, TupperWare
 from .menu import Options
+
 
 
 class BaseCook(ClassSaveLoadMixin):
@@ -386,9 +388,11 @@ class AsyncHeadChef(LasagneTrainer):
                     pass
 
                 # Start up a worker
-                print('Started on {0} using'
+                print('Started on {0} at {3} using'
                       ' ENV={1} and {2}'.format(prefix, _env['THEANO_FLAGS'],
-                                                gpu))
+                                                gpu,
+                                                datetime.now().strftime('%H:%M')
+                                                ))
                 self.job_progress(prefix, 80, 'init')
 
                 p = await async_subprocess('mypython3', '-i',
@@ -451,15 +455,17 @@ class AsyncHeadChef(LasagneTrainer):
             # process terminated. remove process from active list
             # and determine if successful
             self.active_procs.remove(p.p)
+            term_t = datetime.now().strftime('%H:%M')
             if p.p.returncode == 0:
                 self.job_progress(prefix, 100, 'complete')
-                print('Completed ' + fname)
+                print('Completed ' + fname + 'at ' + term_t)
             else:
                 # return code NOT 0 - something has gone wrong
                 self.job_progress(prefix, 100, 'dead')
                 warnings.warn(
-                    'job "{0}" ended with returncode {1}'.format(prefix,
-                                                                 p.p.returncode))
+                    'job "{0}" ended with returncode {1} at {2}'.format(prefix,
+                                                                 p.p.returncode,
+                                                                        term_t))
 
     def __del__(self):
         self.terminate()
