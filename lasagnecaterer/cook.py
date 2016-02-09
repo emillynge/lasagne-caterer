@@ -114,8 +114,6 @@ class LasagneTrainer(CharmapCook):
         s_ep = self.opt.start_epochs
         print('Start train {} epochs\n'.format(s_ep))
 
-
-
         train_err_batches = self.oven.batches_per_epoch.train
         val_err_hist = list(self.val(1))
         train_err_hist = list(self.train_err(train_err_batches))
@@ -124,7 +122,8 @@ class LasagneTrainer(CharmapCook):
         te_err = np.mean(val_err_hist[-l2:])
         tr_err = np.mean(train_err_hist[-l1:])
         message = lambda te, tr: 'te: {0:1.3f} tr: {1:1.3f}'.format(te, tr)
-        pb, msg = pbar('batches', s_ep * train_err_batches, message(te_err, tr_err))
+        pb, msg = pbar('batches', s_ep * train_err_batches,
+                       message(te_err, tr_err))
         pb.start()
 
         for j in range(self.opt.start_epochs):
@@ -138,8 +137,8 @@ class LasagneTrainer(CharmapCook):
             msg.message = message(te_err, tr_err)
         pb.finish()
         # // 4
-        #val_err_hist = list(self.val(1))
-        #train_err_hist = list(self.train_err(train_err_batches))
+        # val_err_hist = list(self.val(1))
+        # train_err_hist = list(self.train_err(train_err_batches))
 
         MEM = 10
         params = deque([
@@ -152,7 +151,7 @@ class LasagneTrainer(CharmapCook):
             i = _i + 1
             try:
                 for _ in self.train(1):
-                    #print(_)
+                    # print(_)
                     pass
 
                 train_err_hist.extend(self.train_err(train_err_batches))
@@ -237,7 +236,7 @@ class AsyncHeadChef(LasagneTrainer):
         self.active_procs = list()
 
     def make_feature_net(self, **features):
-        feature_name = sorted(features.keys())   # sort alphabetically
+        feature_name = sorted(features.keys())  # sort alphabetically
         feature_name = sorted(feature_name,  # sort number of possible values
                               key=lambda k: len(features[k]))[0]
         feature_list = features.pop(feature_name)
@@ -319,7 +318,8 @@ class AsyncHeadChef(LasagneTrainer):
                 # print('breaking')
                 break
 
-            for percent in [int(percent) for percent in pbar_regx.findall(data)]:
+            for percent in [int(percent) for percent in
+                            pbar_regx.findall(data)]:
                 self.job_progress(prefix, percent,
                                   'running-{}'.format(state))
                 if percent == 100:
@@ -333,7 +333,9 @@ class AsyncHeadChef(LasagneTrainer):
     @staticmethod
     def prefix_from_overrides(overrides):
         return '_'.join(
-            '{0}-{1:2.0f}'.format(key, val * 100 if val <= 1 else val) for key, val in overrides)
+            '{0}-{1:2.0f}'.format(key, val * 100 if val <= 1 and isinstance(val,
+                                                                            float) else val)
+            for key, val in overrides)
 
     async def train_model(self, overrides, out_dir, overwrite=False):
         prefix = self.prefix_from_overrides(overrides)
@@ -351,99 +353,105 @@ class AsyncHeadChef(LasagneTrainer):
         with (await self.semaphore) as sem_id:
             self.job_progress(prefix, 33, 'init')
             # get a compiledir
-            comp_dir = self.compiled_base_dir + '/semaphore-1-' + str(
-                sem_id)
+            comp_dir = self.compiled_base_dir + '/semaphore-1-' + str(sem_id)
 
-            with open(out_dir + os.sep + prefix + '.log', 'w',
-                      buffering=1) as logfile:
-                with await self.startup_lock:
-                    self.job_progress(prefix, 66, 'init')
+            # make sure we only start 1 new process at a time so we don't put
+            # all on same GPU
+            with (await self.startup_lock):
+                self.job_progress(prefix, 66, 'init')
 
-                    # find best gpu. Wait if no suitable gpu exists
-                    gpu = best_gpu()
-                    while gpu.free < 2000:
-                        print('Best gpu: {} - Waiting...'.format(gpu))
-                        await asyncio.sleep(1)
-                        gpu = best_gpu()
+                # find best gpu. Wait if no suitable gpu exists
+                try:
+                    gpu = await self.progress_mon.best_gpu()
+                except Exception as e:
+                    print(e)
+                    raise
 
-                    # define environment
-                    _env = dict(os.environ)
-                    _env['THEANO_FLAGS'] = 'base_compiledir={0},device=gpu{1}'.format(
-                        comp_dir, gpu.dev)
+                # define environment -> set execution on specific GPU
+                _env = dict(os.environ)
+                _env['THEANO_FLAGS'] = 'base_compiledir={0},device=gpu{1}'.format(
+                    comp_dir, gpu.dev)
 
-                    # make sure compiledir exists
-                    try:
-                        os.mkdir(comp_dir)
-                    except FileExistsError:
-                        pass
+                # make sure compiledir exists
+                try:
+                    os.mkdir(comp_dir)
+                except FileExistsError:
+                    pass
 
-                    # Start up a worker
-                    print('Started on ' + prefix + ' using ' + _env[
-                        'THEANO_FLAGS'] + '\n')
-                    self.job_progress(prefix, 80, 'init')
+                # Start up a worker
+                print('Started on ' + prefix + ' using ' + _env[
+                    'THEANO_FLAGS'] + '\n')
+                self.job_progress(prefix, 80, 'init')
 
-                    p = await async_subprocess('mypython3', '-i',
-                                               self.basemodel_path,
-                                               stdout=PIPE,
-                                               stderr=PIPE,
-                                               stdin=PIPE,
-                                               env=_env)
+                p = await async_subprocess('mypython3', '-i',
+                                           self.basemodel_path,
+                                           stdout=PIPE,
+                                           stderr=PIPE,
+                                           stdin=PIPE,
+                                           env=_env)
 
-                    self.active_procs.append(p.p)
-                    stdin = p.stdin
-                    assert isinstance(stdin, asyncio.streams.StreamWriter)
+                self.active_procs.append(p.p)
+                stdin = p.stdin
+                assert isinstance(stdin, asyncio.streams.StreamWriter)
 
-                    def wrap(lines) -> bytes:
-                        cmd = b'import sys;return_code = 1;'
-                        cmd += b';'.join(lines)
-                        cmd += b';return_code = 0\n'
-                        return cmd
+                def wrap(lines) -> bytes:
+                    cmd = b'import sys;return_code = 1;'
+                    cmd += b';'.join(lines)
+                    cmd += b';return_code = 0\n'
+                    return cmd
 
-                    lines = [b'print("setting opts")']
-                    # send commands to worker to change features
-                    for feature_name, value in overrides:
-                        lines.append('obj.opt.{0} = {1}'.format(feature_name,
-                                                                value).encode())
-                    lines.append(b'sys.stdout.write(str(obj.opt))')
-                    lines.append(b'del obj.recipe.saved_params')
-                    # startup the training
-                    lines.append(b'obj.cook.auto_train()')
-                    lines.append('obj.save("{0}")'.format(fname).encode())
+                lines = [b'print("setting opts")']
+                # send commands to worker to change features
+                for feature_name, value in overrides:
+                    lines.append('obj.opt.{0} = {1}'.format(feature_name,
+                                                            value).encode())
+                lines.append(b'sys.stdout.write(str(obj.opt))')
+                lines.append(b'del obj.recipe.saved_params')
+                # startup the training
+                lines.append(b'obj.cook.auto_train()')
+                lines.append('obj.save("{0}")'.format(fname).encode())
 
-                    # call sys exit so process will terminate
-                    #stdin.write('sys.exit(0)\n'.format(fname).encode())
 
-                    cmd = wrap(lines)
-                    lines = []
-                    #for l in cmd.split(b'\n'):
-                    #    stdin.write(l + b'\n')
-                    stdin.write(cmd)
-                    stdin.write(b'print("return_code: ", return_code)\n')
-                    stdin.write(b'sys.exit(return_code)\n')
-                    logfile.write(cmd.decode())
-                    logfile.flush()
-                    await stdin.drain()
+                # wrap lines to one statement and feed to process
+                cmd = wrap(lines)
+                stdin.write(cmd)
 
-                    # stdin.close()
+                # call sys exit so process will terminate
+                stdin.write(b'print("return_code: ", return_code)\n')
+                stdin.write(b'sys.exit(return_code)\n')
+                await stdin.drain()
 
-                    # wait some time for the worker to actually start using the
-                    # GPU before releasing startup lock
-                    for i in range(40):
-                        await asyncio.sleep(1)  # wait some time to release lock
-                        self.job_progress(prefix, 60 + i, 'init')
+                # wait some time for the worker to actually start using the
+                # GPU before releasing startup lock
+                for i in range(40):
+                    await asyncio.sleep(1)
+                    self.job_progress(prefix, 60 + i, 'init')
                 # startup lock released here
 
+            # write to progress_monitor and log - wait for process
+            with open(out_dir + os.sep + prefix + '.log', 'w',
+                      buffering=1) as logfile:
+                logfile.write(cmd.decode())
+                logfile.flush()
+
+                # noinspection PyTypeChecker
                 to_do = [self.write_to_log(p.stdout, logfile, prefix),
                          self.write_to_log(p.stderr, logfile, prefix),
                          p.p.wait()]
                 await asyncio.gather(*to_do, loop=self.loop)
-                self.active_procs.remove(p.p)
-                if p.p.returncode == 0:
-                    self.job_progress(prefix, 100, 'complete')
-                    print('Completed ' + fname)
-                else:
-                    self.job_progress(prefix, 100, 'dead')
-                    warnings.warn('job "{0}" ended with returncode {1}'.format(prefix, p.p.returncode))
+
+            # process terminated. remove process from active list
+            # and determine if successful
+            self.active_procs.remove(p.p)
+            if p.p.returncode == 0:
+                self.job_progress(prefix, 100, 'complete')
+                print('Completed ' + fname)
+            else:
+                # return code NOT 0 - something has gone wrong
+                self.job_progress(prefix, 100, 'dead')
+                warnings.warn(
+                    'job "{0}" ended with returncode {1}'.format(prefix,
+                                                                 p.p.returncode))
 
     def __del__(self):
         self.terminate()

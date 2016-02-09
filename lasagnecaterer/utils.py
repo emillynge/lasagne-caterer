@@ -5,7 +5,7 @@ import io
 import _pyio  # for subclassing
 import os
 from collections import namedtuple, OrderedDict, deque, Generator, defaultdict, \
-    MutableSequence
+    MutableSequence, UserDict
 from operator import attrgetter, itemgetter
 from typing import Union, List
 import re
@@ -15,6 +15,7 @@ import warnings
 from decorator import contextmanager
 from functools import singledispatch, partial
 from subprocess import Popen, PIPE
+import time
 import asyncio.subprocess as aiosubprocess
 
 # pip
@@ -564,8 +565,9 @@ class RessourceMonitor:
 
         async def start_proc():
             return (await self.async_exec('nvidia-smi', '-l', '2',
-                                  stdout=asyncio.subprocess.PIPE,
-                                  stderr=FNULL))
+                                          stdout=asyncio.subprocess.PIPE,
+                                          stderr=FNULL))
+
         p = await start_proc()
 
         loop = loop or asyncio.get_event_loop()
@@ -714,10 +716,52 @@ TextStdErr = namedtuple('TextStdErr', 'text')
 
 
 class ChangeStream(asyncio.Queue):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, loop=None, **kwargs):
         super().__init__(*args, **kwargs)
-        self.sentinel2waiters = defaultdict(list)
+        self._loop = loop or asyncio.get_event_loop()
+        self.sentinel2subscribers = defaultdict(list)
+        notifier_init = partial(self.ChangeNotifier, self._loop)
+        self.sentinel2notifier = defaultdict(notifier_init)
         self.terminated = False
+
+    class ChangeNotifier:
+        def __init__(self, loop):
+            """
+            :param notify_classes: Change classes to trigger a wake-up
+            :param loop:
+            :return:
+            """
+            self._waiters = list()
+            self._loop = loop
+            self.change = None
+
+        def __len__(self):
+            return len(self._waiters)
+
+        def __bool__(self):
+            return bool(self._waiters)
+
+        def wake_up(self, change):
+            self.change = change
+            self._wakeup_waiters()
+
+        def _wakeup_waiters(self):
+            waiters = self._waiters
+            if waiters:
+                for waiter in waiters:
+                    if not waiter.cancelled():
+                        waiter.set_result(None)
+            waiters.clear()
+
+        async def wait_for_change(self):
+            waiter = asyncio.futures.Future(loop=self._loop)
+            self._waiters.append(waiter)
+            try:
+                await waiter
+                return self.change
+            finally:
+                if waiter in self._waiters:
+                    self._waiters.remove(waiter)
 
     class BytesRedirecter:
         def __init__(self, change_stream: asyncio.Queue, copy_out,
@@ -814,16 +858,21 @@ class ChangeStream(asyncio.Queue):
         yield
         sys.stderr = stdout
 
-    def register_waiter(self, waiter_coro):
+    async def wait_for_change(self, *sentinels):
+        sentinel = tuple(sorted(sentinels))
+        return await self.sentinel2notifier[sentinel].wait_for_change()
+
+    def register_subscriber(self, waiter_coro):
         if inspect.isfunction(waiter_coro):
             waiter_coro = waiter_coro()
         sentinel = next(waiter_coro)
-        self.sentinel2waiters[sentinel].append(waiter_coro)
+        self.sentinel2subscribers[sentinel].append(waiter_coro)
 
     async def start(self):
         while not self.terminated:
             change = await self.get()
-            for sentinel, waiters in self.sentinel2waiters.items():
+            a = 'hej'
+            for sentinel, waiters in self.sentinel2subscribers.items():
                 if isinstance(change, sentinel):
                     dead_waiters = list()
                     for waiter in waiters:
@@ -833,6 +882,10 @@ class ChangeStream(asyncio.Queue):
                             dead_waiters.append(waiter)
                     for waiter in dead_waiters:
                         waiters.remove(waiter)
+
+            for sentinel, notifier in self.sentinel2notifier.items():
+                if isinstance(change, sentinel):
+                    notifier.wake_up(change)
 
 
 @contextmanager
@@ -898,7 +951,7 @@ class BokehPlots:
             p.quad(left='zeros', right='load', top='name_high',
                    bottom='name_low', source=source)
 
-        @self.change_consumer.register_waiter
+        @self.change_consumer.register_subscriber
         def waiter():
             change = yield CPU
             while not self.terminated:
@@ -925,7 +978,7 @@ class BokehPlots:
                 self._drop_in(source.data, 'free', change.dev, change.free)
                 change = yield
 
-        self.change_consumer.register_waiter(waiter())
+        self.change_consumer.register_subscriber(waiter())
 
         name_range = FactorRange(factors=source.data['name'])
 
@@ -992,7 +1045,7 @@ class BokehPlots:
             p.quad(left='zeros', right='memusage', top='name_high',
                    bottom='name_low', source=source)
 
-        @self.change_consumer.register_waiter
+        @self.change_consumer.register_subscriber
         def waiter():
             loop = asyncio.get_event_loop()
             change = yield GPUProcess
@@ -1034,14 +1087,14 @@ class BokehPlots:
 
         if stdout:
             c = BokehConsole(**console_kwargs)
-            self.change_consumer.register_waiter(waiter(BytesStdOut, c))
-            self.change_consumer.register_waiter(waiter(TextStdOut, c))
+            self.change_consumer.register_subscriber(waiter(BytesStdOut, c))
+            self.change_consumer.register_subscriber(waiter(TextStdOut, c))
             consoles.append(c)
 
         if stderr:
             c = BokehConsole(**console_kwargs)
-            self.change_consumer.register_waiter(waiter(BytesStdErr, c))
-            self.change_consumer.register_waiter(waiter(TextStdErr, c))
+            self.change_consumer.register_subscriber(waiter(BytesStdErr, c))
+            self.change_consumer.register_subscriber(waiter(TextStdErr, c))
             consoles.append(c)
 
         if len(consoles) == 1:
@@ -1059,7 +1112,8 @@ class BokehPlots:
                                 'running-2', 'running-3',
                                 'complete'], reversed(RdYlGn7)))
         source = ColumnDataSource(self._bar_source(job_names, ('percent', 0),
-                                                   ('color', state2color['queued'])))
+                                                   ('color',
+                                                    state2color['queued'])))
         p = figure(
             x_range=Range1d(0, 100), height=(100 + 30 * len(job_names)),
             width=500,
@@ -1074,8 +1128,8 @@ class BokehPlots:
         p.quad(left='zeros', right='percent', top='name_high',
                bottom='name_low', fill_color='color', source=source)
 
-        @self.change_consumer.register_waiter
-        def waiter():
+        @self.change_consumer.register_subscriber
+        def subscriber():
             change = yield JobProgress
             print(change)
             while not self.terminated:
@@ -1110,10 +1164,141 @@ class ProgressMonitor:
     def __init__(self, job_name):
         self.job_name = job_name
         self.change_q = ChangeStream()
+        self.gpus_wmean = self.GPU_WMeans()
         self.plot_gen = BokehPlots(self.change_q)
         self.ressource_mon = RessourceMonitor(self.change_q)
         self.figures = None
         self.terminated = False
+
+    class GPU_WMeans(UserDict):
+        GPU_WMean = namedtuple('GPU_WMean', 'dev load free w_total')
+
+        def __missing__(self, dev):
+            return self.GPU_WMean(dev, 100, 0, 0)
+
+        def __setitem__(self, dev, values):
+            super().__setitem__(dev, self.GPU_WMean(dev, *values))
+
+    def _update_gpu_wmean(self, load, free_mem, w_prev_total,
+                          meas_hist: deque,
+                          new_meas: GPUComb,
+                          lookback_sec=60):
+        """
+        keep track of running gpu weighted mean (wmean)
+        :param load: last calculated gpu load wmean
+        :param free_mem:  last calculated free memory wmean
+        :param w_total: total_weight for last calculated weighted means
+        :param meas_hist: list of (timestamp, GPUProcess) pairs
+        :param new_meas: GPUComb to use for updating
+        :param lookback_sec: number of seconds to keep measuremts before discarding
+        :return: (float, float, float)
+        """
+        now = time.time()
+        if meas_hist:
+            prev_t, prev_meas = meas_hist[-1]
+
+            w_add = now - prev_t  # elapsed seconds between last measurement and now
+            w_total = w_prev_total + w_add
+
+            # add previous measurement to weighted means
+            load = (load * w_prev_total + prev_meas.load * w_add) / w_total
+            free_mem = (
+                           free_mem * w_prev_total + prev_meas.free * w_add) / w_total
+        else:
+            load = new_meas.load
+            free_mem = new_meas.free
+            w_total = 0  # with only 1 measurement there is no "elapsed time"
+
+        meas_hist.append((now, new_meas))
+
+        # discard measurements older than 30 seconds. but do not discard down to
+        # fewer than 2 measurements
+        while meas_hist[0][0] + lookback_sec < now and len(meas_hist) > 2:
+            discard_t, discard_meas = meas_hist.popleft()
+
+            # elapsed seconds from discarded measurerment to next
+            w_sub = meas_hist[0][0] - discard_t
+
+            w_total, w_prev_total = (w_total - w_sub, w_total)
+
+            # subtract discarded measurement from weighted means
+            load = (load * w_prev_total - discard_meas.load * w_sub) / w_total
+            free_mem = (
+                           free_mem * w_prev_total - discard_meas.free * w_sub) / w_total
+
+        return load, free_mem, w_total
+
+    async def gpu_running_average_mon(self):
+        @self.change_q.register_subscriber
+        def subscriber():
+            gpus_meas_hist = defaultdict(deque)
+            gpus_wmeans = self.gpus_wmean
+            new_meas = yield GPUComb
+            while True:
+                dev, load, free, w_total = gpus_wmeans[new_meas.dev]
+                gpus_wmeans[dev] = self._update_gpu_wmean(load, free,
+                                                          w_total,
+                                                          gpus_meas_hist[dev],
+                                                          new_meas)
+                new_meas = yield
+
+    async def best_gpu(self, min_free=2000, max_load=90,
+                       blacklist=tuple(),
+                       whitelist=tuple()) -> GPU_WMeans.GPU_WMean:
+        """
+        Find best available GPU that satisfy requirements
+        "best" means lowest load
+        :param min_free: minimum available free memory
+        :param max_load: maximum load
+        :param blacklist: list of devices that cannot be chosen
+        :param whitelist: list of devices to choose from
+            If empty, all devices not on exclude list can be chosen
+        :return: GPU_WMean
+        """
+        best = self.GPU_WMeans.GPU_WMean(-1, 100.0, 0.0, 0)
+        whitelist = set(whitelist)
+        blacklist = set(blacklist)
+
+        if blacklist and whitelist:
+            whitelist = whitelist.difference(blacklist)
+
+        if whitelist:
+            def valid_dev(dev):
+                return dev in whitelist
+
+        elif blacklist:
+            def valid_dev(dev):
+                return dev not in blacklist
+        else:
+            def valid_dev(dev):
+                return True
+
+        def get_best(curr_best, gpu_wmean):
+            # check if device is white/black listed
+            if not valid_dev(gpu_wmean.dev):
+                return curr_best
+
+            # discard any GPU that does not satisfy load and memory requirements
+            if gpu_wmean.free <= min_free or gpu_wmean.load >= max_load:
+                return curr_best
+
+            if gpu_wmean.load < best.load:
+                return gpu_wmean
+            return curr_best
+
+        # check all known devices
+        for gpu_wmean in self.gpus_wmean.values():
+            best = get_best(best, gpu_wmean)
+
+        # loop until a valid GPU has been found
+        while best.dev < 0:
+            new_meas = await self.change_q.wait_for_change(GPUComb)
+            gpu_wmean = self.gpus_wmean[new_meas.dev]
+            best = get_best(best, gpu_wmean)
+
+        print(self.gpus_wmean)
+        print('best', best)
+        return best
 
     def layout(self, job_names):
         self.figures = vplot(hplot(self.plot_gen.progress(job_names),
@@ -1139,6 +1324,7 @@ class ProgressMonitor:
         self.plot_gen.serve(port=5010, session_id=session_id)
         await asyncio.gather(self.ressource_mon.gpus_mon(),
                              self.ressource_mon.cpus_mon(),
+                             self.gpu_running_average_mon(),
                              self.change_q.start())
 
 

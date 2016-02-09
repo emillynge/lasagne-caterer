@@ -264,7 +264,7 @@ class LSTMBase(LasagneBase):
                                                        (-1, features))).mean()
 
 
-class LearningRateMixin(LasagneBase):
+class LearningRateMixin(ChainedProps):
     @property
     def f_train_alpha(self, decay=.95):
         """
@@ -320,7 +320,7 @@ class DropoutOutMixin(DropoutMixin):
             return self.apply_dropout(super().l_top)
 
 
-class LSTMDropout(DropoutInMixin, DropoutOutMixin, LSTMBase):
+class LSTMDropout(LearningRateMixin, DropoutInMixin, DropoutOutMixin, LSTMBase):
     pass
 
 
