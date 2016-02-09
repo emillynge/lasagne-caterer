@@ -275,14 +275,14 @@ class BokehConsole:
         self.source = self.make_source()
         self.p = self.make_plot()
         self.line_buffer = deque(self.source.data['text'])
-        self._rotate = 1 if input_bottom else -1
-        self._pos = 0 if input_bottom else -1
+        self._rotate = 1 if not input_bottom else -1
+        self._pos = 0 if not input_bottom else -1
         super(BokehConsole, self).__init__()
 
     def make_source(self):
         return ColumnDataSource({'text': [''] * self.n,
                                  'zeros': [0] * self.n,
-                                 'line': list(range(self.n))})
+                                 'line': list(reversed(range(self.n)))})
 
     def make_plot(self):
         p = figure(y_range=(Range1d(-1, self.n + 1)),
@@ -301,24 +301,39 @@ class BokehConsole:
         self.line_buffer[self._pos] = line
         self.source.data['text'] = list(self.line_buffer)
 
+    def _push_lines(self, lines):
+        l = len(lines)
+        if self._pos == -1: # lines come in from bottom
+            for i, line in enumerate(lines):
+                self.line_buffer[i] = line
+            self.line_buffer.rotate(self._rotate * l)
+        else:   # lines come in from top
+            self.line_buffer.rotate(self._rotate * l)
+            for i, line in enumerate(lines):
+                self.line_buffer[i] = line
+        self.source.data['text'] = list(self.line_buffer)
+
     def output_text(self, s):
+        lines = list()
         for line in s.split('\n'):
             if not line:
                 continue
             if len(line) <= self.max_line_len:
-                self._push_line(line)
+                lines.append(line)
             else:
                 tokens = list()
                 i = -1
                 for token in line.split(' '):
                     i += 1 + len(token)
                     if i > self.max_line_len:
-                        self._push_line(' '.join(tokens))
+                        lines.append(' '.join(tokens))
                         tokens = [token]
                         i = len(token)
                     else:
                         tokens.append(token)
-                self._push_line(' '.join(tokens))
+                lines.append(' '.join(tokens))
+        self._push_lines(lines)
+
 
 
 JobProgress = namedtuple('JobProgress', 'name percent state')

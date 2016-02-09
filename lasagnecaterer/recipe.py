@@ -199,7 +199,7 @@ class LasagneBase(ChainedProps, ClassSaveLoadMixin, metaclass=ChainPropsABCMetac
 
 class LSTMBase(LasagneBase):
     @args_from_opt(1)
-    def build_lstm_layers(self, l_prev, n_hid_unit, n_hid_lay, grad_clip=5):
+    def build_lstm_layers(self, l_prev, n_hid_unit, n_hid_lay, grad_clip=100):
         """
         Construct a number of LSTM layers taking l_prev as boottom input
         :param l_prev:
