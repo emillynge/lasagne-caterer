@@ -6,7 +6,7 @@ if sys.version_info < (3, 4):
 
 setup(
         name='lasagnecaterer',
-        version='0.1',
+        version='0.2',
         packages=['lasagnecaterer'],
         url='https://github.com/emillynge/lasagne-caterer',
         license='GNU GENERAL PUBLIC LICENSE  Version 3',
