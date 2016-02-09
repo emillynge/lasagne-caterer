@@ -562,9 +562,11 @@ class RessourceMonitor:
             self.nv2cuda_coro(subproc_exec),
             self.pid2owner_coro(subproc_exec))
 
-        p = await self.async_exec('nvidia-smi', '-l', '2',
+        async def start_proc():
+            return (await self.async_exec('nvidia-smi', '-l', '2',
                                   stdout=asyncio.subprocess.PIPE,
-                                  stderr=FNULL)
+                                  stderr=FNULL))
+        p = await start_proc()
 
         loop = loop or asyncio.get_event_loop()
         gpus = dict()
@@ -576,6 +578,9 @@ class RessourceMonitor:
         seen_pids = list()
         while not self.terminated:
             line = await p.stdout.readline()
+            if p.stdout.at_eof():
+                warnings.warn('nvidia-smi died..  restarting')
+                p = await start_proc()
             line = line.decode()
             if do_GPUComb:
                 nvdev = nv_line2nvdev(line, nvdev)
@@ -1043,7 +1048,12 @@ class BokehPlots:
             return consoles[0].p
         return hplot(*(c.p for c in consoles))
 
+    @staticmethod
+    def _ellipsis_name(name):
+        return '|'.join(re.findall('[a-z]+[^a-z]*\d+[^a-z]*', name))
+
     def progress(self, job_names, **kwargs):
+        job_names = [self._ellipsis_name(nam) for nam in job_names]
         job_name2idx = dict((name, i) for i, name in enumerate(job_names))
         state2color = dict(zip(['dead', 'queued', 'init', 'running-1',
                                 'running-2', 'running-3',
@@ -1052,7 +1062,7 @@ class BokehPlots:
                                                    ('color', state2color['queued'])))
         p = figure(
             x_range=Range1d(0, 100), height=(100 + 30 * len(job_names)),
-            width=400,
+            width=500,
             y_range=FactorRange(factors=source.data['name']),
             tools=[HoverTool(tooltips=[("job", "@name"),
                                        ("percent", "@percent")])],
@@ -1069,7 +1079,7 @@ class BokehPlots:
             change = yield JobProgress
             print(change)
             while not self.terminated:
-                idx = job_name2idx.get(change.name, None)
+                idx = job_name2idx.get(self._ellipsis_name(change.name), None)
                 if idx is None:
                     warnings.warn('unknown job!: "{}"'.format(change))
                     continue
