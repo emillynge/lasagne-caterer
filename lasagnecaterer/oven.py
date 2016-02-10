@@ -424,3 +424,171 @@ class FullArrayBatchGenerator(CharmappedBatchGenerator):
     @property
     def bools_per_batch(self, features):
         return self.chars_per_batch * features
+
+
+class ContigousAcrossBatch(FullArrayBatchGenerator):
+    """
+    Produces batches where sequences are contiguous across batches
+     input element x[b, t, s] is element in sequence #s in batch #b at time #t
+     T = sequence length
+     B = batch size (number of sequences in batch)
+
+     input element in raw input stream I => I[n]
+
+     x[b, T, s] = I[n]
+     x[b + 1, 0, s] = I[n+1]
+
+                   position       offset
+     n(b, t, s) = (s * T + t) + (b * B * T)
+
+     This means that sequences are coupled from batch b to b + 1
+        y[b,T,s] == x[b+1,0,s]
+     if
+        x[b,t,s] predicts x[b,t + 1,s]
+
+    """
+
+    debug = DEBUGFLAGS
+    @args_from_opt(1)
+    def get_array(self, part, batch_sz, features):
+        """
+        Fetch stream, put into array, shuffle and save it
+        :param part:
+        :param batch_sz:
+        :param features:
+        :return:
+        """
+        stream = getattr(self.split_streams, part)
+        stream.seek(0)
+        I = np.array(list(stream.read()), dtype=np.bool).flatten()
+        I_crop = I[:getattr(self.split_len, part) * features]
+        return I_crop.reshape((batch_sz, -1, features)).transpose(1, 0, 2).flatten()
+
+    @property
+    def split_len(self, batch_sz):
+        """
+        Actual character length of each split (part, val train)
+        :param batch_sz:
+        :return:
+        """
+        SplitLen = namedtuple('SplitLen', 'train val test')
+        l2crop = lambda l: l - (l % batch_sz)
+        return SplitLen(*(l2crop(l) for l in self.stream_lengths))
+
+
+    @property
+    def chars_per_batch(self, batch_sz, seq_len):
+        """
+        Number of characters needed to form one batch
+        Every sequence in batch needs 1 extra character to provide the offset
+        for predictions
+        :param batch_sz:
+        :param seq_len:
+        :param seq_overlap:
+        :param batch_overlap:
+        :return:
+        """
+        char_per_seq = seq_len + 1
+        char_per_batch = char_per_seq * batch_sz
+        return char_per_batch
+
+
+    @property
+    def batches_per_epoch(self, batch_sz):
+        cpb = self.chars_per_batch
+
+        # reduce cpb: we reuse 1 character per sequence per batch
+        cpb = cpb - batch_sz
+        BPE = namedtuple('BPE', 'train val test')
+
+        def bpe_from_split_len(l):
+            # fenceposting: cannot reuse last prediction of last batch
+            l = l - batch_sz
+            return l // cpb
+
+        return BPE(*(bpe_from_split_len(l) for l in self.split_len))
+
+    @args_from_opt(1)
+    def reshape2xy_batch_chunk(self, flat, batch_sz, seq_len, win_sz, features, seq_overlap=True, batch_overlap=True):
+        """
+        Reshape a flat array into (x,y) pair of sequences
+        :param flat: flat view of current batch chunk
+        :param batch_sz: number of sequences in a batch
+        :param seq_len: timesteps in a sequence
+        :param win_sz: Not implemented == 1
+        :param features: number of classes for input and output
+        :param seq_overlap: Whether sequences can overlap
+        :param batch_overlap: Whether batches can overlap
+        :return:
+        """
+        if not(seq_overlap and batch_overlap and win_sz == 1):
+            raise NotImplementedError('This generator currently only works with overlap and win_sz==1')
+
+        # get correct number of elements for matrix
+        x = flat[:-features * batch_sz] # all, excluding last element which has len == features
+        y = flat[features * batch_sz:]  # all, excluding first element which has len == features
+
+
+        # do reshape and then transpose (dimshuffle) to get
+        # (batch_sz, seq_len, features)
+        x = x.reshape((seq_len, batch_sz, 1, features)).transpose(1, 0, 2, 3)
+        y = y.reshape((seq_len, batch_sz, features)).transpose(1, 0, 2)
+
+        return x, y
+
+    @args_from_opt(1)
+    def prepare_flat_array(self, part, features, batch_sz, seq_len):
+        lock = self.get_lock(part)
+        if lock.locked():
+            raise PermissionError('{} is already has a generator working on it.'
+                                  'If you need multiple generators you should '
+                                  'copy this oven'.format(part))
+
+        with lock:
+            mode = getattr(self.modes, part)
+            full = getattr(self, part + '_full')
+            flat = getattr(self, part + '_view_flat')
+
+
+            bpb = self.bools_per_batch
+
+            # get bools used per batch
+            bpb_u = bpb - features * batch_sz
+
+            bpe = getattr(self.batches_per_epoch, part)
+
+
+
+            if mode == 'simple':
+                # advance seq_len minus overlap of 1 char
+                shuffle = lambda j:  j + bpb_u
+
+            elif mode == 'random':
+                # jump to completely random char
+
+                # last char idx that will leave space for a full batch
+                max_c = ((bpe - 2) * bpb_u + bpb) // features
+                shuffle = lambda j: np.random.random_integers(0, max_c) * features
+
+            elif mode == 'random_start':
+                # like simple, but starting position can vary up to seq_len
+
+                # how many chars left unused if we start at 0?
+                lee_way = (getattr(self.split_len, part) // batch_sz - 1) % seq_len
+
+                def shuffle(j):
+                    if j < 0:
+                        return np.random.random_integers(0, lee_way) * features
+                    return j + bpb_u
+            else:
+                raise ValueError('unknown mode "{}"'.format(mode))
+
+            try:
+                i = -bpb_u
+                while True:
+                    i = shuffle(i)
+                    flat[:] = full[i:i+bpb]
+                    _i = yield i
+                    i = _i or i  # possible to change i
+            except IndexError:
+                raise StopIteration('Out of bounds') from IndexError
