@@ -176,8 +176,6 @@ class LasagneTrainer(CharmapCook):
 
             min_val_err = np.min(val_err)
 
-            oldest_val_err = val_err[0]
-
             # store or discard
             if min_val_err >= te_err:  # current error is as good or better than all previous
                 # store
@@ -189,12 +187,15 @@ class LasagneTrainer(CharmapCook):
                 print('Early stopping..', val_err)
                 break
 
-            # check if we are making progress
-            # oldest model should have perf_tol worse performance PER STEP
-            # than current best
-            if perf_tol and (oldest_val_err * (1 - perf_tol) ** len(val_err) < min_val_err):
-                print('Early stopping..', val_err)
-                break
+            if i >= MEM:
+                oldest_val_err = val_err[-1]
+                # check if we are making progress
+                # oldest model should have perf_tol worse performance PER STEP
+                # than current best
+                expected_dec = (1 - perf_tol) ** (len(val_err) - 1)
+                if perf_tol and (oldest_val_err * expected_dec < min_val_err):
+                    print('Early stopping..', val_err)
+                    break
 
         else:
             print('Did not find a minimum. Stopping')
@@ -373,7 +374,7 @@ class AsyncHeadChef(LasagneTrainer):
                 self.job_progress(prefix, 66, 'init')
 
                 # find best gpu. Wait if no suitable gpu exists
-                gpu = await self.progress_mon.best_gpu()
+                gpu = await self.progress_mon.best_gpu(max_load=70)
 
 
                 # define environment -> set execution on specific GPU

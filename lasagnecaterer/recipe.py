@@ -199,20 +199,24 @@ class LasagneBase(ChainedProps, ClassSaveLoadMixin, metaclass=ChainPropsABCMetac
 
 class LSTMBase(LasagneBase):
     @args_from_opt(1)
-    def build_lstm_layers(self, l_prev, n_hid_unit, n_hid_lay, grad_clip=100):
+    def build_recurrent_layers(self, l_prev, n_hid_lay):
         """
-        Construct a number of LSTM layers taking l_prev as boottom input
+        Construct a number of LSTM layers taking l_prev as bottom input
         :param l_prev:
-        :param n_hid_unit:
         :param n_hid_lay:
         :return:
         """
         for i in range(n_hid_lay):
             print('LSTM-in', i, l_prev.output_shape)
-            l_prev = L.layers.LSTMLayer(l_prev, n_hid_unit,
+            l_prev = self.make_recurrent_layer(l_prev)
+        return l_prev
+
+    @args_from_opt(1)
+    def make_recurrent_layer(self, l_prev, n_hid_unit, grad_clip=100):
+        return L.layers.LSTMLayer(l_prev, n_hid_unit,
                                         grad_clipping=grad_clip,
                                         nonlinearity=L.nonlinearities.tanh)
-        return l_prev
+
 
     @args_from_opt(1)
     def out_transform(self, l_prev, n_hid_unit, features):
@@ -233,7 +237,7 @@ class LSTMBase(LasagneBase):
         fit LSTM layers in between bottom and top
         :return:
         """
-        return self.build_lstm_layers(self.l_bottom)
+        return self.build_recurrent_layers(self.l_bottom)
 
     @args_from_opt(1)
     def init_params(self, saved_params, W_range=0.08):
@@ -319,10 +323,37 @@ class DropoutOutMixin(DropoutMixin):
         else:
             return self.apply_dropout(super().l_top)
 
+# noinspection PyUnresolvedReferences
+class DropoutBetweenMixin(DropoutMixin):
+    """
+    Apply dropout between two consecutive recurrent layers
+    """
+
+    @args_from_opt(1)
+    def build_recurrent_layers(self, l_prev, n_hid_lay, dropout_mid=None):
+        """
+
+        :param l_prev:
+        :param n_hid_lay:
+        :param dropout_mid:
+        :return:
+        """
+        for i in range(n_hid_lay):
+            print('Layer #', i, l_prev.output_shape)
+
+            l_prev = self.make_recurrent_layer(l_prev)
+            if i + 1 < n_hid_lay:
+                l_prev = self.apply_dropout(l_prev, dropout_mid)
+
+        return l_prev
+
 
 class LSTMDropout(LearningRateMixin, DropoutInMixin, DropoutOutMixin, LSTMBase):
     pass
 
+
+class LSTMKarpath(LearningRateMixin, DropoutOutMixin, DropoutBetweenMixin, LSTMBase):
+    pass
 
 """
 class LSTMDropoutLR(DropoutInOutMixin, LearningRateMixin, LSTMBase):
