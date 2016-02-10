@@ -302,33 +302,29 @@ class LearningRateMixin(ChainedProps):
 
 class DropoutMixin(ChainedProps):
     @args_from_opt(1)
-    def apply_dropout(self, l_prev, dropout=.5):
-        return L.layers.DropoutLayer(l_prev, p=dropout)
+    def apply_dropout(self, l_prev, specific_dropout=None, dropout=.5):
+        if specific_dropout is None:
+            return L.layers.DropoutLayer(l_prev, p=dropout)
+        return L.layers.DropoutLayer(l_prev, p=specific_dropout)
 
 
 class DropoutInMixin(DropoutMixin):
     @property
     def l_bottom(self, dropout_in=None):
-        if dropout_in is not None:
-            return self.apply_dropout(super().l_bottom, dropout=dropout_in)
-        else:
-            return self.apply_dropout(super().l_bottom)
+        return self.apply_dropout(super().l_bottom, specific_dropout=dropout_in)
 
 
 class DropoutOutMixin(DropoutMixin):
     @property
     def l_top(self, dropout_out=None):
-        if dropout_out is not None:
-            return self.apply_dropout(super().l_top, dropout=dropout_out)
-        else:
-            return self.apply_dropout(super().l_top)
+        return self.apply_dropout(super().l_top, specific_dropout=dropout_out)
+
 
 # noinspection PyUnresolvedReferences
 class DropoutBetweenMixin(DropoutMixin):
     """
     Apply dropout between two consecutive recurrent layers
     """
-
     @args_from_opt(1)
     def build_recurrent_layers(self, l_prev, n_hid_lay, dropout_mid=None):
         """
@@ -343,7 +339,7 @@ class DropoutBetweenMixin(DropoutMixin):
 
             l_prev = self.make_recurrent_layer(l_prev)
             if i + 1 < n_hid_lay:
-                l_prev = self.apply_dropout(l_prev, dropout_mid)
+                l_prev = self.apply_dropout(l_prev, specific_dropout=dropout_mid)
 
         return l_prev
 
