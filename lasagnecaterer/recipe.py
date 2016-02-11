@@ -8,6 +8,7 @@ from functools import (lru_cache, partial)
 # pip packages
 from itertools import chain
 
+import sys
 from theano import tensor as T
 import theano
 import lasagne as L
@@ -532,7 +533,8 @@ class LSTMStateReuse(LSTMBase):
 
 
     @args_from_opt(1)
-    def make_recurrent_layer(self, l_prev, batch_sz, n_hid_unit, grad_clip=100):
+    def make_recurrent_layer(self, l_prev, batch_sz, seq_len, n_hid_unit, grad_clip=100,
+                             unroll=False):
         state_shape = (batch_sz, n_hid_unit)
         h_param = L.utils.create_param(L.init.Constant(0.0), state_shape,
                                        name="h_state")
@@ -542,10 +544,14 @@ class LSTMStateReuse(LSTMBase):
         hid = L.layers.InputLayer((batch_sz, n_hid_unit), input_var=h_param)
         cell = L.layers.InputLayer((batch_sz, n_hid_unit), input_var=c_param)
 
+        if unroll:
+            sys.setrecursionlimit(int(2000 + batch_sz * seq_len))
         raw_lay = self.LSTMLayer(l_prev, n_hid_unit,
                                  hid_init=hid, cell_init=cell,
                                  grad_clipping=grad_clip,
-                                 nonlinearity=L.nonlinearities.tanh, name='LSTM_raw')
+                                 nonlinearity=L.nonlinearities.tanh,
+                                 name='LSTM_raw',
+                                 unroll_scan=unroll)
         return_lay = self.ExtractLSTMOut(raw_lay, name='LSTM_return')
         state_lay = self.ExtractLastStates(raw_lay, name='LSTM_states')
 

@@ -93,7 +93,7 @@ class LasagneTrainer(CharmapCook):
 
     def train(self, epochs) -> List[None]:
         for x, y in self.oven.iter_epoch(epochs):
-            yield self.recipe.f_train_noreturn(x, y)
+            yield self.recipe.f_train(x, y)
 
     def train_err(self, batches):
         for x, y in self.oven.iter_batch(batches, part='train'):
@@ -114,50 +114,47 @@ class LasagneTrainer(CharmapCook):
             raise ValueError('Options missing. Need {}'.format(required_opt))
 
         s_ep = self.opt.start_epochs
-        print('Start train {} epochs\n'.format(s_ep))
+        def move_pbar(_pb, it):
+            for nex in it:
+                _pb.update(_pb.currval + 1)
+                yield nex
 
-        train_err_batches = self.oven.batches_per_epoch.train
-        val_err_hist = list(self.val(1))
-        train_err_hist = list(self.train_err(train_err_batches))
+        print('Start train {} epochs\n'.format(s_ep))
+        bpe_train = self.oven.batches_per_epoch.train
+        bpe_val = self.oven.batches_per_epoch.val
+
+        message = lambda te, tr: 'te: {0:1.3f} tr: {1:1.3f}'.format(te, tr)
+        pb, msg = pbar('batches', s_ep * (bpe_train + bpe_val), message(-1, -1))
+        pb.start()
+
+        train_err_hist = list(move_pbar(pb, self.train(1)))
+        val_err_hist = list(move_pbar(pb, self.val(1)))
+
         l1 = len(train_err_hist)
         l2 = len(val_err_hist)
         te_err = np.mean(val_err_hist[-l2:])
         tr_err = np.mean(train_err_hist[-l1:])
-        message = lambda te, tr: 'te: {0:1.3f} tr: {1:1.3f}'.format(te, tr)
-        pb, msg = pbar('batches', s_ep * train_err_batches,
-                       message(te_err, tr_err))
-        pb.start()
+        msg.message = message(te_err, tr_err)
 
-        for j in range(self.opt.start_epochs):
-            for _ in self.train(1):
-                pb.update(pb.currval + 1)
+        for j in range(self.opt.start_epochs - 1):
+            train_err_hist.extend(move_pbar(pb, self.train(1)))
+            val_err_hist.extend(move_pbar(pb, self.val(1)))
 
-            train_err_hist.extend(self.train_err(train_err_batches))
-            val_err_hist.extend(self.val(1))
             te_err = np.mean(val_err_hist[-l2:])
             tr_err = np.mean(train_err_hist[-l1:])
             msg.message = message(te_err, tr_err)
         pb.finish()
-        # // 4
-        # val_err_hist = list(self.val(1))
-        # train_err_hist = list(self.train_err(train_err_batches))
 
         perf_tol = self.opt.get('perf_tol', 0.0)
         MEM = 10
-        params = deque([
-            self.recipe.get_all_params_copy()])  # BytesIO() for _ in range(MEM))
-        val_err = deque(
-            [np.mean(val_err_hist)])  # 10.0**10 for _ in range(MEM))
+        params = deque([self.recipe.get_all_params_copy()])
+        val_err = deque([np.mean(val_err_hist)])
 
         pb, msg = pbar('epochs', self.opt.decay_epochs, message(te_err, tr_err))
         for _i in pb(range(self.opt.decay_epochs)):
             i = _i + 1
             try:
-                for _ in self.train(1):
-                    # print(_)
-                    pass
-
-                train_err_hist.extend(self.train_err(train_err_batches))
+                train_err_hist.extend(self.train(1))
                 val_err_hist.extend(self.val(1))
                 te_err = np.mean(val_err_hist[-l2:])
                 tr_err = np.mean(train_err_hist[-l1:])
@@ -210,6 +207,7 @@ class LasagneTrainer(CharmapCook):
         self.box['train_error_hist'] = train_err_hist
 
 
+# noinspection PyUnresolvedReferences
 class LearningRateMixin:
     def __init__(self, *args, **kwargs):
         self._epochs = 0
@@ -219,7 +217,7 @@ class LearningRateMixin:
         step = max(self._epochs - self.recipe.opt.start_epochs, 0)
 
         for x, y in self.oven.iter_epoch(epochs, part='train'):
-            yield self.recipe.f_train_noreturn(step=step)(x, y)
+            yield self.recipe.f_train(step=step)(x, y)
         self._epochs += epochs
 
     def train_err(self, batches):
@@ -233,6 +231,25 @@ class LearningRateMixin:
     def test(self, epochs):
         for x, y in self.oven.iter_epoch(epochs, part='test'):
             yield self.recipe.f_cost(x, y)
+
+
+# noinspection PyUnresolvedReferences
+class ResetStateMixin:
+    def train(self, *args, **kwargs) -> List[None]:
+        self.recipe.reset_hidden_states()
+        return super().train(*args, **kwargs)
+
+    def train_err(self, *args, **kwargs) -> List[None]:
+        self.recipe.reset_hidden_states()
+        return super().train_err(*args, **kwargs)
+
+    def val(self, *args, **kwargs) -> List[None]:
+        self.recipe.reset_hidden_states()
+        return super().val(*args, **kwargs)
+
+    def test(self, *args, **kwargs) -> List[None]:
+        self.recipe.reset_hidden_states()
+        return super().test(*args, **kwargs)
 
 
 class AsyncHeadChef(LasagneTrainer):
@@ -473,6 +490,9 @@ class AsyncHeadChef(LasagneTrainer):
 
 
 class AsyncHCLearningRate(LearningRateMixin, AsyncHeadChef):
+    pass
+
+class AsyncHCLearningRateStateReuse(ResetStateMixin, LearningRateMixin, AsyncHeadChef):
     pass
 
 
