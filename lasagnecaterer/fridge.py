@@ -2,6 +2,7 @@
 For storing lasagnas!
 """
 # builtins
+import re
 from collections import (namedtuple, OrderedDict, defaultdict)
 from collections.abc import Sequence
 from functools import partial
@@ -11,7 +12,7 @@ import json
 import os
 import logging
 from pprint import pprint
-from zipfile import ZipFile, ZipInfo, ZIP_BZIP2, ZIP_STORED
+from zipfile import ZipFile, ZipInfo, ZIP_BZIP2, ZIP_STORED, ZipExtFile
 import pickle
 import warnings
 import sys
@@ -26,7 +27,7 @@ from numpy import ndarray
 from elymetaclasses.abc import io as ioabc
 
 # relative
-from .utils import any_to_stream
+from .utils import any_to_char_stream
 
 class JsonSaveLoadMixin(ABC):
     """
@@ -90,7 +91,10 @@ class ClassDescriptionMixin:
     @staticmethod
     def class_from_dscr(descr: ClassDescription):
         module = import_module(descr.modulename)
-        return getattr(module, descr.clsname)
+        try:
+            return getattr(module, descr.clsname)
+        except AttributeError as e:
+            raise ImportError(e) from e
 
     @classmethod
     def class_from_fname(cls, fname, splitter):
@@ -112,6 +116,42 @@ class ClassSaveLoadMixin(ClassDescriptionMixin, JsonSaveLoadMixin):
         return cls.class_from_dscr(descr)
 
 
+class SynthesizerMixin(ClassSaveLoadMixin):
+    def to_dict(self):
+        bases = self.__class__.__bases__
+        if len([b for b in bases if issubclass(b, SynthesizerMixin)]) > 1:
+            raise NotImplementedError('Synthesizing already synthesized bases'
+                                      'is currently not supported.\nbases: ' + str(bases))
+
+        return {'base_descriptions': [self.dscr_from_class(klass)._asdict()
+                                      for klass in bases],
+                'metaclass_description': self.dscr_from_class(type(self.__class__))._asdict(),
+                'namespace': {'__module__': self.__class__.__module__,
+                              '__qualname__': self.__class__.__qualname__},
+                'name': self.__class__.__name__,
+                'synth_descr': ClassSaveLoadMixin.to_dict(self)}
+
+    @classmethod
+    def from_dict(cls, synth_descr, metaclass_description, name,
+                  base_descriptions, namespace):
+        synth_descr = ClassDescription(**synth_descr)
+        try:
+            synth_cls = cls.class_from_dscr(synth_descr)
+            return synth_cls
+        except ImportError:
+            pass
+
+        metaclass = cls.class_from_dscr(ClassDescription(**metaclass_description))
+        bases = tuple(cls.class_from_dscr(ClassDescription(**descr))
+                      for descr in base_descriptions)
+        synth_cls = metaclass.__new__(metaclass, name, bases, namespace)
+        if synth_descr.modulename not in sys.modules:
+            sys.modules[synth_descr.modulename] = type(sys)(synth_descr.modulename)
+
+        setattr(sys.modules[synth_descr.modulename], synth_descr.clsname, synth_cls)
+        return synth_cls
+
+
 class ZipSaveError(Exception):
     pass
 
@@ -122,11 +162,10 @@ class ZipLoadError(Exception):
 class SaveLoadZipFilemixin(ClassDescriptionMixin, ABC):
     pickle_classes = [SharedVariable,
                       ndarray]
-
+    ignore_extentions = ['.py', '.pyc']
     @property
     def _pickle_classes(self):
         return tuple(self.pickle_classes)
-
 
     @classmethod
     def write_main(cls):
@@ -145,18 +184,20 @@ class SaveLoadZipFilemixin(ClassDescriptionMixin, ABC):
         __main__.append('obj.bootstrap()')
         return '\n'.join(__main__)
 
-    @abstractmethod
     def bootstrap(self):
         pass
 
-    def _save(self, stream, data, compression=ZIP_STORED,
+    def _save(self, stream, data, manifest, compression=ZIP_STORED,
               handle_unknown=warnings.warn):
         with ZipFile(stream, mode='w', compression=compression) as zf:
             for obj_name, obj in data.items():
                 ext = None
                 buffer = io.BytesIO()
                 if isinstance(obj, ClassSaveLoadMixin):
-                    ext = 'slcls'
+                    if isinstance(obj, SynthesizerMixin):
+                        ext = 'slsyn'
+                    else:
+                        ext = 'slcls'
                     strbuffer = io.TextIOWrapper(buffer)
                     obj.save(strbuffer)
                     strbuffer.flush()
@@ -172,6 +213,11 @@ class SaveLoadZipFilemixin(ClassDescriptionMixin, ABC):
                     modulename, clsname = self.dscr_from_class(obj.__class__)
                     ext = 'slzip.' + modulename + '.' + clsname
                     obj.save(buffer)
+
+                elif isinstance(obj, ndarray):
+                    import numpy
+                    ext = 'npy'
+                    numpy.save(buffer, obj)
 
                 elif isinstance(obj, self._pickle_classes):
                     ext = 'pkl'
@@ -208,7 +254,9 @@ class SaveLoadZipFilemixin(ClassDescriptionMixin, ABC):
                         handle_unknown(msg)
 
                 zf.writestr(obj_name + '.' + ext, buffer.getvalue())
-            zf.writestr('__main__.py', self.write_main())
+            self._write_manifest(zf, manifest)
+            if '__main__' not in manifest:
+                zf.writestr('__main__.py', self.write_main())
 
     @classmethod
     def _load(cls, stream, handle_unknown=warnings.warn):
@@ -216,6 +264,9 @@ class SaveLoadZipFilemixin(ClassDescriptionMixin, ABC):
         with ZipFile(stream, mode='r') as zf:
             for file_info in zf.filelist:
                 fname = file_info.filename
+                if '/' in fname or any(fname.endswith(ign) for ign in
+                                           cls.ignore_extentions):
+                        continue
                 assert isinstance(file_info, ZipInfo)
                 obj = None
                 obj_name = None
@@ -224,12 +275,19 @@ class SaveLoadZipFilemixin(ClassDescriptionMixin, ABC):
                         obj_name = fname[:-4]
                         obj = pickle.load(obj_stream)
 
-                    elif file_info.filename.endswith('.json'):
+                    elif fname.endswith('.json'):
                         obj_name = fname[:-5]
                         obj = json.loads(obj_stream.read().decode('utf8'))
 
-                    elif file_info.filename == '__main__.py':
-                        continue
+                    elif fname.endswith('.npy'):
+                        import numpy
+                        obj_name = fname[:-4]
+                        obj = numpy.load(obj_stream)
+
+                    elif '.slsyn' in fname:
+                        strobj_str = io.TextIOWrapper(obj_stream)
+                        obj = SynthesizerMixin.load(strobj_str)
+                        obj_name = fname[:-6]
 
                     elif '.slcls' in fname:
                         strobj_str = io.TextIOWrapper(obj_stream)
@@ -277,14 +335,93 @@ class SaveLoadZipFilemixin(ClassDescriptionMixin, ABC):
                 data[obj_name] = obj
         return data
 
-    def save(self, file, **kwargs):
+    def _write_manifest(self, main_zf, manifest: Sequence):
+        for module in manifest:
+            self._zip_module(main_zf, module)
+
+    def _zip_module(self, main_zf: ZipFile, module):
+        if isinstance(module, str):
+            module = import_module(module)
+        assert isinstance(module, type(sys))
+        folder, pyfile = os.path.split(module.__file__)
+        zipped = not os.path.isfile(module.__file__)
+        name = module.__name__
+        if zipped:
+            self._zip_module_in_archive(main_zf, module.__package__, folder,
+                                        pyfile, name)
+        else:
+            self._zip_module_in_filesystem(main_zf, module.__package__, folder,
+                                           pyfile, name)
+
+    def _zip_module_in_archive(self, main_zf: ZipFile, package_name, folder,
+                               pyfile, name):
+        """
+            zf_path = re.findall(r'(.+\.lfr)' + os.sep +    # main zip
+                         r'(.+' + os.sep + r')?' +  # folder in zip (may not be present)
+                         r'(.+?$)',                 # .py file
+                         filename)
+        """
+        print(package_name)
+        subfolders = folder.split(os.sep)
+        zip_path = subfolders.pop(0)
+        while not os.path.isfile(zip_path):
+            zip_path += os.sep + subfolders.pop(0)
+
+        with open(zip_path, 'rb') as fp:
+            with ZipFile(fp, 'r') as zf:
+                # single file module
+                if not package_name:
+                    path_in_zip = os.sep.join(subfolders + [pyfile])
+                    file_info = zf.getinfo(path_in_zip)
+                    with zf.open(file_info, 'r') as zf_mod:
+                        main_zf.writestr(name + '.py', zf_mod.read())
+                        return
+
+                for file_info in zf.filelist:
+                    package_folder = os.sep.join(subfolders)
+                    print(file_info)
+                    l = len(package_folder)
+                    if file_info.filename.startswith(package_folder):
+                        path_in_package = file_info.filename[l:]
+                        file_info.filename = package_name + path_in_package
+                        with zf.open(file_info, 'r') as zff:
+                            print('writing')
+                            main_zf.writestr(file_info, zff.read())
+                return
+
+    def _zip_module_in_filesystem(self, main_zf: ZipFile, package_name, folder,
+                                  pyfile, name):
+        # single file module
+        if not package_name:
+            file_path = folder + os.sep + pyfile if folder else pyfile
+            main_zf.write(file_path, arcname=name + '.py')
+            return
+
+        l = len(folder)
+        stack = list(os.scandir(folder))
+        while stack:
+            file = stack.pop()
+            if file.is_file():
+                path_in_package = file.path[l:]
+                main_zf.write(file.path, package_name + path_in_package)
+            elif file.is_dir():
+                stack.extend(os.scandir(file.path))
+
+    def save(self, file, manifest=tuple(), **kwargs):
+        print(manifest)
         data = self.to_dict()
         assert isinstance(data, OrderedDict)
         if isinstance(file, str):
-            with open(file, 'wb') as fp:
-                self._save(fp, data, **kwargs)
+            if manifest:    # when including manifest we might need to buffer
+                fp_buf = io.BytesIO()
+                self._save(fp_buf, data, manifest, **kwargs)
+                with open(file, 'wb') as fp:
+                    fp.write(fp_buf.getvalue())
+            else:
+                with open(file, 'wb') as fp:
+                    self._save(fp, data, manifest, **kwargs)
         else:
-            self._save(file, data, **kwargs)
+            self._save(file, data, manifest, **kwargs)
 
     @classmethod
     def load(cls, file, data_overrides: dict=None, **kwargs):
