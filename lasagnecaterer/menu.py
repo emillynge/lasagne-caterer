@@ -4,30 +4,20 @@ Hide complexity from the client. Lots of packaged deals.
 """
 
 # builtins
-from collections import (namedtuple, OrderedDict, defaultdict)
-from collections.abc import Sequence
-from abc import (ABC, abstractmethod, abstractclassmethod)
-import json
-import os
-import logging
-from zipfile import ZipFile, ZipInfo, ZIP_BZIP2, ZIP_STORED
-import pickle
-import warnings
 import sys
-import io
 from typing import (List, Tuple)
 from argparse import ArgumentParser
 
 # pip packages
-from theano.compile import SharedVariable
-from numpy import ndarray
 
 # github packages
-from elymetaclasses.abc import io as ioabc
 from elymetaclasses.utils import Options as _Options
 
 # relative
-from .utils import any_to_stream
+
+from . import recipe, fridge, oven, cook
+from .oven import FullArrayBatchGenerator
+from .fridge import JsonSaveLoadMixin, UniversalFridgeLoader
 
 
 class Choices(ArgumentParser):
@@ -42,9 +32,6 @@ class Choices(ArgumentParser):
         for shortarg, longarg in choices.items():
             self.add_argument('-' + shortarg, '--' + longarg, dest=shortarg,
                               action='store_true')
-
-
-from .fridge import JsonSaveLoadMixin, UniversalFridgeLoader
 
 
 class Options(_Options, JsonSaveLoadMixin):
@@ -72,19 +59,11 @@ class Options(_Options, JsonSaveLoadMixin):
 
 ### Concrete
 
-from .oven import FullArrayBatchGenerator
-from . import recipe, fridge, oven, cook
-
-
 def basic(opt):
     return fridge.BaseFridge(opt, FullArrayBatchGenerator, recipe.LSTMBase,
                              cook.CharmapCook)
 
-def empty_fridge(file):
-    return UniversalFridgeLoader.load(file)
-
-
-def empty_and_swap(file, *class_swaps, **overrides):
+def empty_fridge(file, *class_swaps, **overrides):
     for klass in class_swaps:
         if issubclass(klass, recipe.LasagneBase):
             overrides['recipe_cls'] = klass

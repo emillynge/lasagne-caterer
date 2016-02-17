@@ -12,11 +12,13 @@ import io
 import _pyio
 import logging
 from collections.abc import (Sequence)
+from itertools import chain
 from typing import List, Union
 import random
 from contextlib import contextmanager
 
 # pip packages
+import struct
 from theano import tensor as T
 import theano
 import lasagne as L
@@ -31,7 +33,7 @@ from elymetaclasses.annotations import SingleDispatch, LastResort, type_assert
 from elymetaclasses.abc import io as ioabc
 
 # relative imports
-from .utils import (from_start, any_to_stream)
+from .utils import (from_start, any_to_char_stream)
 from .fridge import JsonSaveLoadMixin, ClassSaveLoadMixin
 
 DEBUGFLAGS = []#'nocache']
@@ -95,7 +97,7 @@ class CharMap(OrderedDict, JsonSaveLoadMixin):
     @classmethod
     def from_text(cls, inp):
         charmap = cls()
-        charmap.train(any_to_stream(inp))
+        charmap.train(any_to_char_stream(inp))
         return charmap
 
     def train(self, stream: ioabc.InputStream):
@@ -107,36 +109,37 @@ class CharMap(OrderedDict, JsonSaveLoadMixin):
 
 SplitStreams = namedtuple('SplitStreams', 'train val test')
 
-class BatchBuffer(io.StringIO):
+
+class InputBuffer:
     class SD(SingleDispatch):
 
-        @staticmethod
-        def _input2sequence(inp: LastResort):
+        @classmethod
+        def _input2sequence(cls, inp: LastResort):
             logging.log('Cannot determine input type')
             return inp
 
-        @staticmethod
-        def _input2sequence(inp: Sequence):
+        @classmethod
+        def _input2sequence(cls, inp: Sequence):
             return inp
 
-        @staticmethod
-        def _input2sequence(inp: str):
+        @classmethod
+        def _input2sequence(cls, inp: str):
             return inp
 
-        @staticmethod
-        def _input2sequence(inp: ioabc.SeekableInputStream):
+        @classmethod
+        def _input2sequence(cls, inp: ioabc.SeekableInputStream):
             inp.seek(0)
             return inp.read()
 
-        @staticmethod
-        def _input2sequence(inp: ioabc.InputStream):
+        @classmethod
+        def _input2sequence(cls, inp: ioabc.InputStream):
             return inp.read()
 
     def __init__(self, inp, start=None, end=None):
+        super().__init__()
         start = start or 0
         end = end or -1
-        super().__init__(self.SD._input2sequence(inp)[start:end])
-        self.l = self.seek(0, 2)
+        self.write(self.SD._input2sequence(inp)[start:end])
         self.seek(0)
         self.c = Counter()
         self.mode = 'simple'
@@ -144,23 +147,8 @@ class BatchBuffer(io.StringIO):
         self.__read = self.read
 
     def __len__(self):
-        return self.l
-
-    class DummyProgressBar(object):
-        def __init__(self, max_val=None):
-            self.value = 0
-
-        def start(self):
-            pass
-
-        def __next__(self):
-            pass
-
-        def __iter__(self):
-            return self
-
-        def __call__(self, it):
-            return it
+        with self.from_start():
+            return self.seek(0, 2)
 
     def cast_at_read(self, castfun):
         orig_read = super().read
@@ -174,15 +162,24 @@ class BatchBuffer(io.StringIO):
         self.seek(idx)
 
     def splits_idx(self, sub_stream_propotions: Sequence):
-        l = self.seek(0, 2)
+        l = len(self)
         total_prop = sum(sub_stream_propotions)
         normed_props = [0] + [prop/total_prop for prop in sub_stream_propotions]
         fence_posts = [sum(normed_props[:i]) for i in range(1, len(normed_props) + 1)]
         return [int(l * fence_posts) for fence_posts in fence_posts]
 
+    @contextmanager
+    def from_start(self):
+        pos = self.tell()
+        self.seek(0)
+        yield
+        self.seek(pos)
+
     def split(self, sub_stream_propotions: Sequence) -> List[io.StringIO]:
         splits_idx = self.splits_idx(sub_stream_propotions)
-        return [self.from_self(self.getvalue(), start=i1, end=i2) for i1, i2 in zip(splits_idx[:-1], splits_idx[1:])]
+        read_len = [s2 - s1 for s1, s2 in zip(splits_idx[:-1], splits_idx[1:])]
+        with self.from_start():
+            return [self.from_self(self.__read(n)) for n in read_len]
 
     def split3way(self, sub_stream_propotions: Sequence) -> SplitStreams:
         return SplitStreams(*self.split(sub_stream_propotions))
@@ -191,18 +188,150 @@ class BatchBuffer(io.StringIO):
     def from_self(cls, *args, **kwargs):
         return cls(*args, **kwargs)
 
+
+class StringBuffer(InputBuffer, io.StringIO):
+    pass
+
+
+class _FloatBuffer(io.BytesIO):
+    item_sz = 4
+
+    def write(self, float_seq):
+        if isinstance(float_seq, bytes):
+            return super().write(float_seq)
+        n_fl = len(float_seq)
+        b = struct.pack('f' * n_fl, *float_seq)
+        super().write(b)
+        return n_fl
+
+    def read(self, n=-1):
+        b = super().read(self.item_sz * n)
+
+        return memoryview(b).cast('f').tolist()
+
+    def tell(self, *args, **kwargs):
+        return super().tell(*args, **kwargs) // self.item_sz
+
+    def seek(self, pos, whence=0, **kwargs):
+        pos *= self.item_sz
+        pos = super().seek(pos, whence)
+        return pos // self.item_sz
+
+
+class FloatBuffer(InputBuffer, _FloatBuffer):
+    def __init__(self, inp, start=None, end=None):
+        start = start if start is None else start * self.item_sz
+        end = end if end is None else end * self.item_sz
+        super().__init__(inp, start=start, end=end)
+
+    class SD(InputBuffer.SD):
+
+        @staticmethod
+        def file2seq(file):
+            import csv
+            if file.name.endswith('.npy'):
+                return np.load(file).flatten().tolist()
+
+            if file.name.endswith('.csv'):
+                f = io.TextIOWrapper(file)
+                return list(float(i) for i in chain(*(row for row in csv.reader(f))))
+
+        @classmethod
+        def _input2sequence(cls, inp: LastResort):
+            return inp
+
+        @classmethod
+        def _input2sequence(cls, inp: ioabc.SeekableInputStream):
+            inp.seek(0)
+            return cls.file2seq(inp)
+
+        @classmethod
+        def _input2sequence(cls, inp: ioabc.InputStream):
+            return cls.file2seq(inp)
+
+
+class _FloatArrayBuffer(io.BytesIO):
+    item_sz = 4
+
+    def __init__(self, *args, **kwargs):
+        self.array_len = None
+        self._bytes_per_array = None
+        super().__init__(*args, **kwargs)
+
+    @property
+    def bytes_per_array(self):
+        return self.item_sz * self.array_len
+
+    def write(self, array_seq):
+        if isinstance(array_seq, bytes):
+            return super().write(array_seq)
+        n_arr = len(array_seq)
+        if not self.array_len:
+            self.array_len = len(array_seq[0])
+
+        inp = chain(*array_seq) if isinstance(array_seq[0],
+                                              Sequence) else array_seq
+        b = struct.pack('f' * (n_arr * self.array_len), *inp)
+        super().write(b)
+
+    def read(self, n=-1):
+        b = super().read(self.bytes_per_array * n)
+        n_array = len(b) // self.bytes_per_array
+        return memoryview(b).cast('f', [n_array, self.array_len]).tolist()
+
+    def tell(self, *args, **kwargs):
+        return super().tell(*args, **kwargs) // self.bytes_per_array
+
+    def seek(self, pos, whence=0, **kwargs):
+        pos *= self.bytes_per_array
+        pos = super().seek(pos, whence)
+        return pos // self.bytes_per_array
+
+
+class FloatArrayBuffer(InputBuffer, _FloatArrayBuffer):
+    def __init__(self, inp, start=None, end=None):
+        start = start if start is None else start * self.item_sz
+        end = end if end is None else end * self.item_sz
+        super().__init__(inp, start=start, end=end)
+
+    class SD(InputBuffer.SD):
+
+        @staticmethod
+        def file2seq(file):
+            import csv
+            if file.name.endswith('.npy'):
+                return np.load(file).flatten().tolist()
+
+            if file.name.endswith('.csv'):
+                f = io.TextIOWrapper(file)
+                return list(list(float(i) for i in row) for row in csv.reader(f))
+
+        @classmethod
+        def _input2sequence(cls, inp: LastResort):
+            return inp
+
+        @classmethod
+        def _input2sequence(cls, inp: ioabc.SeekableInputStream):
+            inp.seek(0)
+            return cls.file2seq(inp)
+
+        @classmethod
+        def _input2sequence(cls, inp: ioabc.InputStream):
+            return cls.file2seq(inp)
+
 from .utils import ChainPropsABCMetaclass
+
+
 class BufferedBatchGenerator(ChainedProps, ClassSaveLoadMixin, metaclass=ChainPropsABCMetaclass):
     debug = DEBUGFLAGS
 
     @property
     def input_stream(self, inp):
-        return any_to_stream(inp)
-
+        return inp
 
     @property
     def bg(self):
-        return BatchBuffer(self.input_stream)
+        return InputBuffer(self.input_stream)
 
     @property
     def stream_lengths(self, splits='8,1,1'):
@@ -214,7 +343,7 @@ class BufferedBatchGenerator(ChainedProps, ClassSaveLoadMixin, metaclass=ChainPr
     def split_streams(self, splits='8,1,1'):
         splits = [int(s) for s in splits.split(',')]
         bg = self.bg
-        assert isinstance(bg, BatchBuffer)
+        assert isinstance(bg, InputBuffer)
         SplitStreams = namedtuple('SplitStreams', 'train val test')
         return SplitStreams(*bg.split(splits))
 
@@ -223,29 +352,37 @@ class BufferedBatchGenerator(ChainedProps, ClassSaveLoadMixin, metaclass=ChainPr
         BatchModes = namedtuple('BatchModes', 'train val test')
         return BatchModes(*batch_modes.strip().split(','))
 
-    @property
-    def train(self, batch_fun_train='batches_fp'):
-        bg = self.split_streams.train
-        mode = self.modes.train
-        bg.configure(batch_fun_train, mode=mode)
-        return bg
 
+class CharBatchMixin(metaclass=ChainPropsABCMetaclass):
     @property
-    def val(self, batch_fun_test='batches_fp'):
-        bg = self.split_streams.val
-        mode = self.modes.val
-        bg.configure(batch_fun_test, mode=mode)
-        return bg
+    def input_stream(self, inp):
+        return any_to_char_stream(inp)
 
     @property
-    def test(self, batch_fun_test='batches_fp'):
-        bg = self.split_streams.test
-        mode = self.modes.test
-        bg.configure(batch_fun_test, mode=mode)
+    def bg(self):
+        return StringBuffer(self.input_stream)
+
+
+class FloatBatchMixin(metaclass=ChainPropsABCMetaclass):
+    @property
+    def input_stream(self, inp):
+        return any_to_char_stream(inp, bytes)
+
+    @property
+    def bg(self):
+        return FloatBuffer(self.input_stream)
+
+
+class FloatArrayBatchMixin(FloatBatchMixin):
+    @property
+    def bg(self, features):
+        bg = FloatArrayBuffer(self.input_stream)
+        bg.array_len = features
         return bg
 
 
-class CharmappedBatchGenerator(BufferedBatchGenerator):
+
+class CharmappedGeneratorMixin(CharBatchMixin):
     debug = DEBUGFLAGS
 
     @property
@@ -254,7 +391,7 @@ class CharmappedBatchGenerator(BufferedBatchGenerator):
             with from_start(self.input_stream) as inp:
                 return CharMap.from_text(inp)
 
-        stream = any_to_stream(charmap, force_seekable=True)
+        stream = any_to_char_stream(charmap, force_seekable=True)
         try:
             return CharMap.load(stream)
         except json.JSONDecodeError as e:
@@ -270,7 +407,7 @@ class CharmappedBatchGenerator(BufferedBatchGenerator):
         return streams
 
 
-class FullArrayBatchGenerator(CharmappedBatchGenerator):
+class FullArrayBatchGenerator(BufferedBatchGenerator):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.locks = dict((part, Lock()) for part in ['train', 'val', 'test'])
@@ -283,10 +420,11 @@ class FullArrayBatchGenerator(CharmappedBatchGenerator):
         return self.locks[part]
 
     debug = DEBUGFLAGS
-    def get_array(self, part):
+    @args_from_opt(1)
+    def get_array(self, part, dtype='bool'):
         stream = getattr(self.split_streams, part)
         stream.seek(0)
-        return np.array(list(stream.read()), dtype=np.bool).flatten()
+        return np.array(list(stream.read()), dtype=getattr(np, dtype)).flatten()
 
     @property
     def train_full(self):
@@ -313,7 +451,8 @@ class FullArrayBatchGenerator(CharmappedBatchGenerator):
         return self.test_full[:self.bools_per_batch].flatten()
 
     @args_from_opt(1)
-    def reshape2xy_batch_chunk(self, flat, batch_sz, seq_len, win_sz, features, seq_overlap=True, batch_overlap=True):
+    def reshape2xy_batch_chunk(self, flat, batch_sz, seq_len, win_sz, features,
+                               seq_overlap=True, batch_overlap=True, complete=False):
         """
         Reshape a flat array into (x,y) pair of sequences
         :param flat: flat view of current batch chunk
@@ -323,13 +462,20 @@ class FullArrayBatchGenerator(CharmappedBatchGenerator):
         :param features: number of classes for input and output
         :param seq_overlap: Whether sequences can overlap
         :param batch_overlap: Whether batches can overlap
+        :param complete: is this the full array? if so ignore batch_sz and seq_len
         :return:
         """
+
         if not(seq_overlap and batch_overlap and win_sz == 1):
             raise NotImplementedError('This generator currently only works with overlap and win_sz==1')
 
         x = flat[:-features]    # all, excluding last element which has len == features
         y = flat[features:]  # all, excluding first element which has len == features
+
+        if complete:
+            batch_sz = 1
+            seq_len = len(y)
+
         return (x.reshape((batch_sz, seq_len, win_sz, features)),
                 y.reshape((batch_sz, seq_len, features)))
 
@@ -347,6 +493,21 @@ class FullArrayBatchGenerator(CharmappedBatchGenerator):
     @property
     def test(self):
         return self.reshape2xy_batch_chunk(self.test_view_flat)
+
+    # noinspection PyMethodOverriding
+    @property
+    def train_complete(self):
+        return self.reshape2xy_batch_chunk(self.train_full.flatten(), complete=True)
+
+    # noinspection PyMethodOverriding
+    @property
+    def val_complete(self):
+        return self.reshape2xy_batch_chunk(self.val_full.flatten(), complete=True)
+
+    # noinspection PyMethodOverriding
+    @property
+    def test_complete(self):
+        return self.reshape2xy_batch_chunk(self.test_full.flatten(), complete=True)
 
     @property
     def batches_per_epoch(self):
@@ -450,7 +611,7 @@ class ContigousAcrossBatch(FullArrayBatchGenerator):
 
     debug = DEBUGFLAGS
     @args_from_opt(1)
-    def get_array(self, part, batch_sz, features):
+    def get_array(self, part, batch_sz, features, dtype='bool'):
         """
         Fetch stream, put into array, shuffle and save it
         :param part:
@@ -460,7 +621,7 @@ class ContigousAcrossBatch(FullArrayBatchGenerator):
         """
         stream = getattr(self.split_streams, part)
         stream.seek(0)
-        I = np.array(list(stream.read()), dtype=np.bool).flatten()
+        I = np.array(list(stream.read()), dtype=getattr(np, dtype)).flatten()
         I_crop = I[:getattr(self.split_len, part) * features]
         return I_crop.reshape((batch_sz, -1, features)).transpose(1, 0, 2).flatten()
 
@@ -509,7 +670,8 @@ class ContigousAcrossBatch(FullArrayBatchGenerator):
         return BPE(*(bpe_from_split_len(l) for l in self.split_len))
 
     @args_from_opt(1)
-    def reshape2xy_batch_chunk(self, flat, batch_sz, seq_len, win_sz, features, seq_overlap=True, batch_overlap=True):
+    def reshape2xy_batch_chunk(self, flat, batch_sz, seq_len, win_sz, features,
+                               seq_overlap=True, batch_overlap=True, complete=False):
         """
         Reshape a flat array into (x,y) pair of sequences
         :param flat: flat view of current batch chunk
@@ -519,20 +681,30 @@ class ContigousAcrossBatch(FullArrayBatchGenerator):
         :param features: number of classes for input and output
         :param seq_overlap: Whether sequences can overlap
         :param batch_overlap: Whether batches can overlap
+        :param complete: is this the full array? if so ignore batch_sz and seq_len
         :return:
         """
+
+
         if not(seq_overlap and batch_overlap and win_sz == 1):
             raise NotImplementedError('This generator currently only works with overlap and win_sz==1')
 
         # get correct number of elements for matrix
-        x = flat[:-features * batch_sz] # all, excluding last element which has len == features
-        y = flat[features * batch_sz:]  # all, excluding first element which has len == features
+        crop = - (len(flat) % (features * batch_sz))
+
+        x = flat[:-features * batch_sz + crop] # all, excluding last element which has len == features
+        crop = crop or None
+        y = flat[features * batch_sz:crop]  # all, excluding first element which has len == features
+
+        if complete:
+            batch_sz = 1
+            seq_len = len(y)
 
 
         # do reshape and then transpose (dimshuffle) to get
         # (batch_sz, seq_len, features)
-        x = x.reshape((seq_len, batch_sz, 1, features)).transpose(1, 0, 2, 3)
-        y = y.reshape((seq_len, batch_sz, features)).transpose(1, 0, 2)
+        x = x.reshape((-1, batch_sz, 1, features)).transpose(1, 0, 2, 3)
+        y = y.reshape((-1, batch_sz, features)).transpose(1, 0, 2)
 
         return x, y
 
@@ -590,5 +762,11 @@ class ContigousAcrossBatch(FullArrayBatchGenerator):
                     flat[:] = full[i:i+bpb]
                     _i = yield i
                     i = _i or i  # possible to change i
-            except IndexError:
+            except (IndexError, ValueError):
                 raise StopIteration('Out of bounds') from IndexError
+
+
+class Synthetics:
+    class FullArrayCharbatches(CharmappedGeneratorMixin, FullArrayBatchGenerator): pass
+
+    class ContiguousCharBatches(CharmappedGeneratorMixin, ContigousAcrossBatch): pass

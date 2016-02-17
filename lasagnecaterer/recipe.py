@@ -4,6 +4,7 @@ Instructions on how to put together different kinds of lasagnas
 # builtins
 from collections import (namedtuple, defaultdict, OrderedDict)
 from functools import (lru_cache, partial)
+from weakref import WeakKeyDictionary
 
 # pip packages
 from itertools import chain
@@ -17,13 +18,46 @@ import numpy as np
 # github packages
 from elymetaclasses.events import ChainedProps, args_from_opt
 from .utils import ChainPropsABCMetaclass
-from .fridge import ClassSaveLoadMixin
+from .fridge import ClassSaveLoadMixin, SaveLoadZipFilemixin
+
+
+class ScalarParameter:
+    def opt_callback(self, instance, opt_name, value):
+        self.__set__(instance, value)
+
+    def __init__(self, opt_name, spec_type=L.init.Constant, shape=None, default=0.0):
+        self.opt_name = opt_name
+        self.spec_type = spec_type
+        self.shape = shape
+        self.default = default
+        self.instances = WeakKeyDictionary()
+
+    def __get__(self, instance: ChainedProps, obj_type):
+        if instance not in self.instances:
+            opt = instance.opt
+            callback = partial(self.opt_callback, instance)
+            init_val = opt.get(self.opt_name, self.default)
+            if not self.shape:
+                param = theano.shared(self.spec_type(init_val).sample((1,))[0])
+            else:
+                spec = self.spec_type()
+                param = L.utils.create_param(spec, shape=self.shape, name=self.opt_name)
+
+            self.instances[instance] = (param, callback)
+            opt.set_callback(self.opt_name, callback)
+        return self.instances[instance][0]
+
+    def __set__(self, instance, value):
+        self.instances[instance][0].set_value(value)
+
+
+class MixinBase(metaclass=ChainPropsABCMetaclass): pass
 
 
 class LasagneBase(ChainedProps, ClassSaveLoadMixin,
                   metaclass=ChainPropsABCMetaclass):
     @property
-    def l_in(self, seq_len, features, win_sz=1):
+    def l_in(self, features, win_sz=1):
         """
         Input layer into which x feeds
         x is [batch_sz, seq_len, win_sz, features]
@@ -32,7 +66,8 @@ class LasagneBase(ChainedProps, ClassSaveLoadMixin,
         :param win_sz:
         :return:
         """
-        return L.layers.InputLayer((None, seq_len, win_sz, features))
+
+        return L.layers.InputLayer((None, None, win_sz, features))
 
     @property
     def target_values(self):
@@ -68,6 +103,7 @@ class LasagneBase(ChainedProps, ClassSaveLoadMixin,
         (eg. softmax into classes)
         :return:
         """
+
         return self.out_transform(self.l_top)
 
     @property
@@ -173,19 +209,87 @@ class LasagneBase(ChainedProps, ClassSaveLoadMixin,
         No updates is made
         :return:
         """
+        self.all_train_params
         return self.compiled_function([self.l_in.input_var, self.target_values],
                                self.cost_det, allow_input_downcast=True)
 
     @property
-    def f_predict(self):
+    def f_predict(self, features):
         """
         Compiled theano function that takes (x) and predicts y
         Computed *deterministic*
         :return:
         """
-        output = L.layers.get_output(self.l_out, deterministic=True)
-        return self.compiled_function([self.l_in.input_var], output,
+        self.all_train_params
+        resh = L.layers.ReshapeLayer(self.l_out_flat, (-1, features))
+        output_transformed = self.predict_transform(resh)
+        prediction = L.layers.get_output(output_transformed, deterministic=True)
+        return self.compiled_function([self.l_in.input_var], prediction,
                                allow_input_downcast=True)
+
+    def predict_transform(self, x_next_fuzzy) -> T.Tensor:
+        return x_next_fuzzy
+
+    @property
+    def f_predict_single(self, features):
+        """
+        take input sequence of arbitrary length and predict n next characters
+        by feeding characters back into network
+        :return:
+        """
+        print('compiling')
+        self.all_train_params
+        # make list of outputs in 1D list
+        resh = L.layers.ReshapeLayer(self.l_out_flat, (-1, features))
+
+        # Take last prediction
+        y_lay = L.layers.SliceLayer(resh, -1, axis=0)
+
+
+        x_next_fuzzy_lay = L.layers.ReshapeLayer(y_lay, (1, features))
+        x_next_lay = self.predict_transform(x_next_fuzzy_lay)
+        x_next = L.layers.get_output(x_next_lay, deterministic=True)
+        return self.compiled_function([self.l_in.input_var], x_next)
+
+    @args_from_opt(2)
+    def auto_predict(self, x_next, n, features, sentinels: list=None):
+        for _ in range(n):
+            x_next = x_next.reshape(1, -1, 1, features)
+            #self.reset_hidden_states(batched=False)
+            x_next = self.f_predict_single(x_next)
+            yield x_next
+            if sentinels is not None:
+                for sentinel in sentinels:
+                    for e, ee in zip(x_next.flatten(), sentinel.flatten()):
+                        if e != ee:
+                            break
+                    else:
+                        return
+        return
+        outputs_info = [self.l_in.input_var]
+        if hasattr(self, 'hidden_state_updates'):
+            initial, computed = tuple(zip(*self.hidden_state_updates.values()))
+
+            def auropred(*args):
+                return tuple(chain([x_next], computed))
+
+            outputs_info.extend(initial)
+        else:
+            def auropred(*args):
+                return x_next
+        n_stepVar = T.iscalar()
+
+        (out_list, *_), updates = theano.scan(auropred, outputs_info=outputs_info,
+                                        n_steps=n_stepVar)
+
+        f = self.compiled_function([self.l_in.input_var, n_stepVar], out_list,
+                               updates=updates)
+
+        def compiled_function_wrapper(x: np.matrix, n):
+            x = x.reshape((1, -1, 1, features))
+            return f(x, n)
+
+        return compiled_function_wrapper
 
     def out_transform(self, l, *args):
         """
@@ -206,6 +310,14 @@ class LasagneBase(ChainedProps, ClassSaveLoadMixin,
 
 
 class LSTMBase(LasagneBase):
+    class OneHotLayer(L.layers.Layer):
+        def __init__(self, incoming, axis=0, name=None):
+            self.axis = axis
+            super().__init__(incoming, name)
+
+        def get_output_for(self, input, **kwargs):
+            return L.utils.one_hot(T.argmax(input, axis=self.axis), input.shape[self.axis])
+
     @args_from_opt(1)
     def build_recurrent_layers(self, l_prev, n_hid_lay):
         """
@@ -273,6 +385,65 @@ class LSTMBase(LasagneBase):
         return T.nnet.categorical_crossentropy(flattened_output,
                                                self.target_values.reshape(
                                                    (-1, features))).mean()
+
+    @args_from_opt(1)
+    def predict_transform(self, l_out):
+        return self.OneHotLayer(l_out, axis=1, name='onehot')
+
+
+class RandomPredictMixin(MixinBase):
+    pred_sigma = ScalarParameter('pred_sigma')
+
+    class RandomOnehotLayer(L.layers.GaussianNoiseLayer):
+        def get_output_for(self, input, probabilistic=True,  **kwargs):
+            if probabilistic:
+                if self.sigma:
+                    input = T.pow(input, self.sigma) # boost
+                csum = T.cumsum(input, axis=1)
+                last_col = T.repeat(csum[:, -1:None], csum.shape[1], axis=1)
+                normed = csum / last_col
+                normed = T.concatenate([T.zeros((csum.shape[0], 1)), normed], axis=1)
+                rand = self._srng.uniform(input.shape[0:1]).reshape((-1, 1))
+                idx = T.repeat(rand, input.shape[1], axis=1)
+
+                picked = T.le(normed[:, :-1], idx) * T.gt(normed[:, 1:], idx)
+                return picked
+            else:
+                return L.utils.one_hot(T.argmax(input, axis=1), input.shape[1])
+
+    @args_from_opt(1)
+    def predict_transform(self, l_out, pred_sigma=0):
+        return self.RandomOnehotLayer(l_out, sigma=self.pred_sigma, name='pred_trans')
+
+
+class SSEMixin(MixinBase):
+    @args_from_opt(1)
+    def cost_metric(self, flattened_output, features):
+        """
+        Cross entropy cost metric
+        :param flattened_output:
+        :param features:
+        :return:
+        """
+        diff = flattened_output - self.target_values.reshape((-1, features))
+        return (diff @ diff.T).mean()
+
+    @args_from_opt(1)
+    def out_transform(self, l_prev, n_hid_unit, features):
+        """
+        Apply non-linear transform to l_prev
+        :param l_prev:
+        :param n_hid_unit:
+        :param features:
+        :return:
+        """
+
+        l_shp = L.layers.ReshapeLayer(l_prev, (-1, n_hid_unit))
+        l_cat = L.layers.ConcatLayer([l_shp, L.layers.ReshapeLayer(self.l_in, (-1, features))])
+        return L.layers.DenseLayer(l_cat, num_units=features)
+
+    def predict_transform(self, l_out) -> L.layers.Layer:
+        return l_out
 
 
 class LSTMStateReuse(LSTMBase):
@@ -517,9 +688,7 @@ class LSTMStateReuse(LSTMBase):
 
     @property
     def hidden_state_updates(self):
-        from weakref import WeakKeyDictionary
         return WeakKeyDictionary()
-
 
     @args_from_opt('batched')
     def reset_hidden_states(self, batched=True, batch_sz=None, n_hid_unit=None):
@@ -530,6 +699,39 @@ class LSTMStateReuse(LSTMBase):
 
         for layer, (param, update) in self.hidden_state_updates.items():
             param.set_value(zeros)
+
+    class HiddenStates(OrderedDict, SaveLoadZipFilemixin):
+        def __iter__(self):
+            return self.keys()
+
+        def from_dict(cls, *args, **kwargs):
+            return cls(kwargs)
+
+        def to_dict(self) -> OrderedDict:
+            return self
+
+        def bootstrap(self):
+            pass
+
+        @classmethod
+        def from_weak_dict(cls, hidden_states: WeakKeyDictionary):
+            return cls((id(layer), param.get_value()) for layer, (param, update) in
+                hidden_states.items())
+
+
+    def set_hidden_state(self, checkpoint: HiddenStates):
+        for layer, (param, update) in self.hidden_state_updates.items():
+            param.set_value(checkpoint[id(layer)])
+
+    def get_hidden_state(self) -> HiddenStates:
+        return self.HiddenStates.from_weak_dict(self.hidden_state_updates)
+
+    @property
+    def f_print_hidden(self):
+
+        states = L.layers.get_output(list(self.hidden_state_updates.keys()))
+        return theano.function(list(), outputs=states)
+        #for layer, (param, update) in zip(self.hidden_state_updates.items()):
 
 
     @args_from_opt(1)
@@ -572,7 +774,7 @@ class LSTMStateReuse(LSTMBase):
         return super().compiled_function(*args, updates=updates, **kwargs)
 
 
-class LearningRateMixin(ChainedProps):
+class LearningRateMixin(MixinBase):
     @property
     def f_train_alpha_noreturn(self, decay=.95):
         """
@@ -636,7 +838,7 @@ class LearningRateMixin(ChainedProps):
         return partial(f, alpha)
 
 
-class DropoutMixin(ChainedProps):
+class DropoutMixin(MixinBase):
     @args_from_opt(1)
     def apply_dropout(self, l_prev, specific_dropout=None, dropout=.5):
         if specific_dropout is None:
@@ -689,7 +891,6 @@ class LSTMDropout(LearningRateMixin, DropoutInMixin, DropoutOutMixin, LSTMBase):
 class LSTMKarpath(LearningRateMixin, DropoutOutMixin, DropoutBetweenMixin,
                   LSTMStateReuse):
     pass
-
 
 """
 class LSTMDropoutLR(DropoutInOutMixin, LearningRateMixin, LSTMBase):

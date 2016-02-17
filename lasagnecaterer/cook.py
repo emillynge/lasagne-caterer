@@ -22,14 +22,15 @@ import tqdm
 import theano
 
 # github packages
+from lasagnecaterer import oven
+
 from elymetaclasses.abc import io as ioabc
 
 # relative
-from .utils import any_to_stream, pbar, best_gpu, ProgressMonitor, ChangeStream, \
+from .utils import any_to_char_stream, pbar, best_gpu, ProgressMonitor, ChangeStream, \
     JobProgress, async_subprocess, BatchSemaphore
 from .recipe import LasagneBase
-from .oven import BufferedBatchGenerator, CharmappedBatchGenerator, \
-    FullArrayBatchGenerator
+from .oven import Synthetics, FullArrayBatchGenerator
 from .fridge import ClassSaveLoadMixin, TupperWare
 from .menu import Options
 
@@ -56,6 +57,10 @@ class BaseCook(ClassSaveLoadMixin):
         """
         if 'all_params' in self.fridge.shelves['recipe']:
             self.recipe.saved_params = self.fridge.shelves['recipe'].all_params
+        try:
+            super().open_shop()
+        except AttributeError:
+            pass
 
     def close_shop(self):
         """
@@ -64,27 +69,17 @@ class BaseCook(ClassSaveLoadMixin):
         """
         self.fridge.shelves['recipe'][
             'all_params'] = self.recipe.get_all_params_copy()
+        try:
+            super().close_shop()
+        except AttributeError:
+            pass
 
     def to_dict(self):
         self.close_shop()
         return super().to_dict()
 
 
-class CharmapCook(BaseCook):
-    def open_shop(self):
-        super().open_shop()
-        oven = self.oven
-        assert isinstance(oven, CharmappedBatchGenerator)
-        self.oven = oven
-        if 'charmap' in self.fridge.shelves['oven']:
-            self.oven.charmap = self.fridge.shelves['oven'].charmap
-
-    def close_shop(self):
-        super().close_shop()
-        self.fridge.shelves['oven']['charmap'] = self.oven.charmap
-
-
-class LasagneTrainer(CharmapCook):
+class LasagneTrainer(BaseCook):
     def open_shop(self):
         super().open_shop()
         oven = self.oven
@@ -109,7 +104,6 @@ class LasagneTrainer(CharmapCook):
 
     def auto_train(self, pbar=pbar):
         required_opt = ('start_epochs', 'decay_epochs')
-        print(self.val(1))
         if any(o not in self.opt for o in required_opt):
             raise ValueError('Options missing. Need {}'.format(required_opt))
 
@@ -146,7 +140,9 @@ class LasagneTrainer(CharmapCook):
         pb.finish()
 
         perf_tol = self.opt.get('perf_tol', 0.0)
-        MEM = 10
+        MEM = self.opt.get('opt_mem', 10)
+        grace_epochs = self.opt.get('grace_epochs', s_ep + MEM) - s_ep
+
         params = deque([self.recipe.get_all_params_copy()])
         val_err = deque([np.mean(val_err_hist)])
 
@@ -184,7 +180,7 @@ class LasagneTrainer(CharmapCook):
                 print('Early stopping..', val_err)
                 break
 
-            if i >= MEM:
+            if i >= grace_epochs:
                 oldest_val_err = val_err[-1]
                 # check if we are making progress
                 # oldest model should have perf_tol worse performance PER STEP
@@ -206,6 +202,19 @@ class LasagneTrainer(CharmapCook):
         self.box['val_error_hist'] = val_err_hist
         self.box['train_error_hist'] = train_err_hist
 
+
+class CharmapMixin:
+    def open_shop(self):
+        super().open_shop()
+        _oven = self.oven
+        assert isinstance(_oven, oven.CharmappedGeneratorMixin)
+        self.oven = _oven
+        if 'charmap' in self.fridge.shelves['oven']:
+            self.oven.charmap = self.fridge.shelves['oven'].charmap
+
+    def close_shop(self):
+        super().close_shop()
+        self.fridge.shelves['oven']['charmap'] = self.oven.charmap
 
 # noinspection PyUnresolvedReferences
 class LearningRateMixin:
@@ -244,7 +253,7 @@ class ResetStateMixin:
         return super().train_err(*args, **kwargs)
 
     def val(self, *args, **kwargs) -> List[None]:
-        self.recipe.reset_hidden_states()
+        #self.recipe.reset_hidden_states()
         return super().val(*args, **kwargs)
 
     def test(self, *args, **kwargs) -> List[None]:

@@ -81,9 +81,9 @@ def force_seek(inp: ioabc.InputStream) -> ioabc.SeekableInputStream:
 
 
 @singledispatch
-def any_to_stream(inp: Union[str, ioabc.InputStream, bytes],
-                  output_type: Union[str, bytes] = str,
-                  force_seekable=False) -> Union[ioabc.InputStream,
+def any_to_char_stream(inp: Union[str, ioabc.InputStream, bytes],
+                       output_type: Union[str, bytes] = str,
+                       force_seekable=False) -> Union[ioabc.InputStream,
                                                  ioabc.SeekableInputStream]:
     """
     Transfrom any kind of input into a
@@ -103,7 +103,7 @@ def any_to_stream(inp: Union[str, ioabc.InputStream, bytes],
     pass
 
 
-@any_to_stream.register(str)
+@any_to_char_stream.register(str)
 def str_to_stream(inp: str, output_type: Union[str, bytes] = str,
                   force_seekable=False):
     if output_type not in (str, bytes):
@@ -119,7 +119,7 @@ def str_to_stream(inp: str, output_type: Union[str, bytes] = str,
     return io.BytesIO(inp.encode())
 
 
-@any_to_stream.register(ioabc.InputStream)
+@any_to_char_stream.register(ioabc.InputStream)
 def stream_to_stream(inp: ioabc.InputStream,
                      output_type: Union[str, bytes] = str,
                      force_seekable=False):
@@ -134,7 +134,7 @@ def stream_to_stream(inp: ioabc.InputStream,
         mode = ''
     else:
         # giving up
-        return any_to_stream(inp.read())
+        return any_to_char_stream(inp.read())
 
     if force_seekable and not seekable(inp):
         # convert to buffered
@@ -158,7 +158,7 @@ def stream_to_stream(inp: ioabc.InputStream,
         return io.BytesIO(inp.read().encode())
 
 
-@any_to_stream.register(bytes)
+@any_to_char_stream.register(bytes)
 def bytes_to_stream(inp: bytes, output_type: Union[str, bytes] = str,
                     force_seekable=False):
     if output_type is bytes:
@@ -593,11 +593,13 @@ class RessourceMonitor:
         nvdev = None
         tasks = list()
         seen_pids = list()
+        last_update = time.time()
         while not self.terminated:
             line = await p.stdout.readline()
             if p.stdout.at_eof():
                 warnings.warn('nvidia-smi died..  restarting')
                 p = await start_proc()
+                warnings.warn('nvidia-smi restarted')
             line = line.decode()
             if do_GPUComb:
                 nvdev = nv_line2nvdev(line, nvdev)
@@ -606,8 +608,10 @@ class RessourceMonitor:
                 # a gpu was found in stdout
                 if nvgpu:
                     prev_gpu = gpus.get(nvgpu.nvdev, None)
-                    # has anything changed?
-                    if prev_gpu != nvgpu[1:]:
+                    # has anything changed? (also update at least ever 10 sec)
+                    if prev_gpu != nvgpu[1:] or time.time() - last_update > 10:
+                        last_update = time.time()
+
                         # translate to cuda dev and update gpus
                         gpu = GPUComb(nv2cuda[nvgpu.nvdev], *nvgpu[1:])
                         gpus[nvgpu.nvdev] = nvgpu[1:]
@@ -1376,3 +1380,4 @@ class IDContext:
     def __exit__(self, exc_type, exc, tb):
         self.semaphore.ids.append(self.id)
         self.semaphore.release()
+

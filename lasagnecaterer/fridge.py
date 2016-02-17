@@ -167,23 +167,6 @@ class SaveLoadZipFilemixin(ClassDescriptionMixin, ABC):
     def _pickle_classes(self):
         return tuple(self.pickle_classes)
 
-    @classmethod
-    def write_main(cls):
-        modulename, clsname = cls.dscr_from_class(cls)
-        __main__ = ["#!/usr/bin/python3"]
-
-        # Make sure cwd is in path
-        __main__.append('import sys\nimport os')
-        __main__.append("sys.path.insert(0, os.path.abspath('.'))")
-
-        # import the correct class and use classmethod load
-        __main__.append('from {0} import {1}'.format(modulename, clsname))
-        __main__.append('obj = {0}.load(sys.argv[0])'.format(clsname))
-
-        # boot up!
-        __main__.append('obj.bootstrap()')
-        return '\n'.join(__main__)
-
     def bootstrap(self):
         pass
 
@@ -255,8 +238,6 @@ class SaveLoadZipFilemixin(ClassDescriptionMixin, ABC):
 
                 zf.writestr(obj_name + '.' + ext, buffer.getvalue())
             self._write_manifest(zf, manifest)
-            if '__main__' not in manifest:
-                zf.writestr('__main__.py', self.write_main())
 
     @classmethod
     def _load(cls, stream, handle_unknown=warnings.warn):
@@ -335,23 +316,41 @@ class SaveLoadZipFilemixin(ClassDescriptionMixin, ABC):
                 data[obj_name] = obj
         return data
 
-    def _write_manifest(self, main_zf, manifest: Sequence):
-        for module in manifest:
-            self._zip_module(main_zf, module)
-
-    def _zip_module(self, main_zf: ZipFile, module):
+    def _stardardize_modules(self, module):
         if isinstance(module, str):
             module = import_module(module)
-        assert isinstance(module, type(sys))
+            return self._stardardize_modules(module)
+
+        if isinstance(module, type(sys)):
+            return module, module.__name__
+
+        if isinstance(module, (tuple, list)):
+            return self._stardardize_modules(module[0])[0], module[1]
+
+    def _write_manifest(self, main_zf, manifest: Sequence):
+        module_names = set()
+        for module, module_name in (self._stardardize_modules(m) for m in manifest):
+            module_names.add(module_name)
+            self._zip_module(main_zf, module, module_name)
+
+        if '__main__' not in module_names:
+            from . import bootstrap
+            self._zip_module(main_zf, bootstrap, '__main__')
+
+    def _zip_module(self, main_zf: ZipFile, module, module_name):
         folder, pyfile = os.path.split(module.__file__)
         zipped = not os.path.isfile(module.__file__)
-        name = module.__name__
-        if zipped:
-            self._zip_module_in_archive(main_zf, module.__package__, folder,
-                                        pyfile, name)
+        if module.__package__ == module.__name__:
+            package_name = module_name
         else:
-            self._zip_module_in_filesystem(main_zf, module.__package__, folder,
-                                           pyfile, name)
+            package_name = ""
+
+        if zipped:
+            self._zip_module_in_archive(main_zf, package_name, folder,
+                                        pyfile, module_name)
+        else:
+            self._zip_module_in_filesystem(main_zf, package_name, folder,
+                                           pyfile, module_name)
 
     def _zip_module_in_archive(self, main_zf: ZipFile, package_name, folder,
                                pyfile, name):
@@ -463,7 +462,6 @@ class TupperWare(OrderedDict, SaveLoadZipFilemixin):
 
         if args.p:
             pprint(self)
-
 
     def __init__(self, *args, **kwargs):
         if '_make_called' not in kwargs:
