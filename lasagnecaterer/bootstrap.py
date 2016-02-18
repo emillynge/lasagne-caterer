@@ -1,14 +1,17 @@
 #!/usr/bin/python3
-def main():
+def get_fridge():
     # Make sure cwd is in path
     import sys
     import os
-    from .menu import empty_fridge
+    from lasagnecaterer.menu import empty_fridge
     sys.path.insert(1, os.path.abspath('.'))
 
     # import the correct class and use classmethod load
-    fr = empty_fridge(sys.argv[0])
+    return empty_fridge(sys.argv[0])
 
+
+def main():
+    fr = get_fridge()
     # boot up!
     fr.bootstrap()
 

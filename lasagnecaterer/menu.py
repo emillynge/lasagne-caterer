@@ -5,6 +5,7 @@ Hide complexity from the client. Lots of packaged deals.
 
 # builtins
 import sys
+from collections import Sequence
 from typing import (List, Tuple)
 from argparse import ArgumentParser
 
@@ -12,12 +13,6 @@ from argparse import ArgumentParser
 
 # github packages
 from elymetaclasses.utils import Options as _Options
-
-# relative
-
-from . import recipe, fridge, oven, cook
-from .oven import FullArrayBatchGenerator
-from .fridge import JsonSaveLoadMixin, UniversalFridgeLoader
 
 
 class Choices(ArgumentParser):
@@ -34,6 +29,7 @@ class Choices(ArgumentParser):
                               action='store_true')
 
 
+from .fridge import JsonSaveLoadMixin, UniversalFridgeLoader
 class Options(_Options, JsonSaveLoadMixin):
     @classmethod
     def from_dict(cls, opt_list=List[Tuple]):
@@ -59,11 +55,18 @@ class Options(_Options, JsonSaveLoadMixin):
 
 ### Concrete
 
+# relative
+
+from . import recipe, oven, cook, fridge
+from .oven import FullArrayBatchGenerator
+
 def basic(opt):
     return fridge.BaseFridge(opt, FullArrayBatchGenerator, recipe.LSTMBase,
                              cook.CharmapCook)
 
+
 def empty_fridge(file, *class_swaps, **overrides):
+    fr = UniversalFridgeLoader
     for klass in class_swaps:
         if issubclass(klass, recipe.LasagneBase):
             overrides['recipe_cls'] = klass
@@ -71,4 +74,6 @@ def empty_fridge(file, *class_swaps, **overrides):
             overrides['oven_cls'] = klass
         elif issubclass(klass, cook.BaseCook):
             overrides['cook_cls'] = klass
-    return UniversalFridgeLoader.load(file, data_overrides=overrides)
+        elif issubclass(klass, fridge.BaseFridge):
+            fr = klass
+    return fr.load(file, data_overrides=overrides)

@@ -17,6 +17,7 @@ import pickle
 import warnings
 import sys
 import io
+from typing import Union
 
 # pip packages
 from theano.compile import SharedVariable
@@ -29,7 +30,25 @@ from elymetaclasses.abc import io as ioabc
 # relative
 from .utils import any_to_char_stream
 
-class JsonSaveLoadMixin(ABC):
+
+class SaveLoadBase(ABC):
+    @abstractclassmethod
+    def from_dict(cls, *args, **kwargs) -> object:
+        pass
+
+    @abstractmethod
+    def to_dict(self) -> dict:
+        pass
+
+    @abstractclassmethod
+    def load(cls, file: Union[ioabc.InputStream, str]) -> object:
+        pass
+
+    @abstractmethod
+    def save(self, file: Union[ioabc.InputStream, str]):
+        pass
+
+class JsonSaveLoadMixin(SaveLoadBase):
     """
     Mixin for adding save/load utility to a class.
     implementation must provide the abstract methods:
@@ -63,15 +82,6 @@ class JsonSaveLoadMixin(ABC):
 
     def dumps(self):
         return json.dumps(self.to_dict())
-
-    @abstractclassmethod
-    def from_dict(cls, *args, **kwargs):
-        pass
-
-    @abstractmethod
-    def to_dict(self) -> dict:
-        pass
-
 
 ClassDescription = namedtuple('ClassDescription', 'modulename clsname')
 
@@ -159,7 +169,7 @@ class ZipLoadError(Exception):
     pass
 
 
-class SaveLoadZipFilemixin(ClassDescriptionMixin, ABC):
+class SaveLoadZipFilemixin(ClassDescriptionMixin, SaveLoadBase):
     pickle_classes = [SharedVariable,
                       ndarray]
     ignore_extentions = ['.py', '.pyc']
@@ -206,10 +216,11 @@ class SaveLoadZipFilemixin(ClassDescriptionMixin, ABC):
                     ext = 'pkl'
                     pickle.dump(obj, buffer)
 
-                elif isinstance(obj, Sequence) and isinstance(obj[0], self._pickle_classes):
+                elif isinstance(obj, Sequence) and obj and isinstance(obj[0], self._pickle_classes):
                     ext = 'lstzip'
                     self._save(buffer,
                                dict((str(i), o) for i, o in enumerate(obj)),
+                               tuple(),
                                compression=ZIP_BZIP2,
                                handle_unknown=warnings.warn)
 
@@ -263,7 +274,10 @@ class SaveLoadZipFilemixin(ClassDescriptionMixin, ABC):
                     elif fname.endswith('.npy'):
                         import numpy
                         obj_name = fname[:-4]
-                        obj = numpy.load(obj_stream)
+                        seekable_stream = io.BytesIO(obj_stream.read())
+                        seekable_stream.seek(0)
+                        obj = numpy.load(seekable_stream)
+                        del seekable_stream
 
                     elif '.slsyn' in fname:
                         strobj_str = io.TextIOWrapper(obj_stream)
@@ -316,26 +330,30 @@ class SaveLoadZipFilemixin(ClassDescriptionMixin, ABC):
                 data[obj_name] = obj
         return data
 
-    def _stardardize_modules(self, module):
+    def _standardize_modules(self, module):
         if isinstance(module, str):
             module = import_module(module)
-            return self._stardardize_modules(module)
+            return self._standardize_modules(module)
 
         if isinstance(module, type(sys)):
             return module, module.__name__
 
         if isinstance(module, (tuple, list)):
-            return self._stardardize_modules(module[0])[0], module[1]
+            return self._standardize_modules(module[0])[0], module[1]
 
     def _write_manifest(self, main_zf, manifest: Sequence):
         module_names = set()
-        for module, module_name in (self._stardardize_modules(m) for m in manifest):
+        for module, module_name in (self._standardize_modules(m) for m in manifest):
             module_names.add(module_name)
             self._zip_module(main_zf, module, module_name)
 
-        if '__main__' not in module_names:
+        try:
+            main_zf.getinfo('__main__.py')
+        except KeyError:
             from . import bootstrap
             self._zip_module(main_zf, bootstrap, '__main__')
+            module_names.add('__main__')
+        return module_names
 
     def _zip_module(self, main_zf: ZipFile, module, module_name):
         folder, pyfile = os.path.split(module.__file__)
@@ -510,6 +528,8 @@ class BaseFridge(SaveLoadZipFilemixin, ClassDescriptionMixin):
             if box_label.endswith('_box'):
                 owner = box_label[:-4]
                 self.shelves[owner] = box
+
+        self.box = self.shelves['fridge']
         self.opt = opt
         self.oven = oven_cls(opt)
         self.recipe = recipe_cls(opt)
@@ -554,3 +574,67 @@ class UniversalFridgeLoader(SaveLoadZipFilemixin):
 
     def bootstrap(self):
         pass
+
+
+# noinspection PyUnresolvedReferences
+class BaseBootstrapMixin:
+    assume_exists = ['lasagnecaterer']
+
+    class BootstrapWrapper(ClassSaveLoadMixin):
+        def __init__(self, boot_func):
+            self.boot_func = boot_func
+
+        def __call__(self, *args, **kwargs):
+            self.boot_func(*args, **kwargs)
+
+        def to_dict(self):
+            descr = self.dscr_from_class(self.boot_func)
+            return descr._asdict()
+
+    @property
+    def has_bootstrap_func(self):
+        return 'bootstrap_func' in self.box
+
+    def _wrap_boot_func(self):
+        if not isinstance(self.box['bootstrap_func'], SaveLoadBase):
+            self.box['bootstrap_func'] = self.BootstrapWrapper(self.box['bootstrap_func'])
+
+    def needed_modules(self):
+        if isinstance(self.box['bootstrap_func'], self.BootstrapWrapper):
+            bootstrap_func = self.box['bootstrap_func'].boot_func
+        else:
+            bootstrap_func = self.box['bootstrap_func']
+
+        needed = list()
+
+        module, module_name = self._standardize_modules(bootstrap_func.__module__)
+        if module.__package__ or module_name not in self.assume_exists:
+            needed.append(module_name)
+
+        return needed + self.box.get('aux_modules', [])
+
+    def bootstrap(self):
+        if self.has_bootstrap_func:
+            self.box['bootstrap_func'](self)
+
+    def set_bootstrap(self, bootstrap_func, *aux_modules):
+        self.box['bootstrap_func'] = bootstrap_func
+        self.box['aux_modules'] = [self._standardize_modules(m)[1]
+                                       for m in aux_modules]
+
+    def to_dict(self):
+        self._wrap_boot_func()
+        return super().to_dict()
+
+    def _write_manifest(self, main_zf, manifest: Sequence):
+        module_names = super()._write_manifest(main_zf, manifest)
+        if not self.has_bootstrap_func:
+            return module_names
+
+        need_mods = [m for m in self.needed_modules() if m not in module_names]
+
+        return module_names.update(super()._write_manifest(main_zf, need_mods))
+
+
+class BootstrapFridge(BaseBootstrapMixin, BaseFridge):
+    pass
