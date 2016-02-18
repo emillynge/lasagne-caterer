@@ -8,7 +8,7 @@ import warnings
 from asyncio.subprocess import PIPE
 from collections import (namedtuple, OrderedDict, defaultdict, deque)
 from functools import partial
-from typing import List
+from typing import List, Union
 import re
 import asyncio
 from aiohttp import web
@@ -27,13 +27,13 @@ from lasagnecaterer import oven
 from elymetaclasses.abc import io as ioabc
 
 # relative
+from . import recipe as LCrecipe
 from .utils import any_to_char_stream, pbar, best_gpu, ProgressMonitor, ChangeStream, \
-    JobProgress, async_subprocess, BatchSemaphore
+    JobProgress, async_subprocess, BatchSemaphore, MixinProp, MixinRequires, mixin_mock
 from .recipe import LasagneBase
 from .oven import Synthetics, FullArrayBatchGenerator
-from .fridge import ClassSaveLoadMixin, TupperWare
 from .menu import Options
-
+from .fridge import ClassSaveLoadMixin, TupperWare, BaseFridge
 
 
 class BaseCook(ClassSaveLoadMixin):
@@ -48,7 +48,17 @@ class BaseCook(ClassSaveLoadMixin):
         box = fridge.shelves['cook']
         assert isinstance(box, TupperWare)
         self.box = box
-        self.open_shop()
+        self.open_all_shops()
+
+    def close_all_shops(self):
+        for klass in self.__class__.__mro__:
+            if hasattr(klass, 'close_shop'):
+                klass.open_shop(self)
+
+    def open_all_shops(self):
+        for klass in self.__class__.__mro__:
+            if hasattr(klass, 'open_shop'):
+                klass.open_shop(self)
 
     def open_shop(self):
         """
@@ -56,11 +66,8 @@ class BaseCook(ClassSaveLoadMixin):
         :return:
         """
         if 'all_params' in self.fridge.shelves['recipe']:
+            # noinspection PyPropertyAccess
             self.recipe.saved_params = self.fridge.shelves['recipe'].all_params
-        try:
-            super().open_shop()
-        except AttributeError:
-            pass
 
     def close_shop(self):
         """
@@ -69,10 +76,6 @@ class BaseCook(ClassSaveLoadMixin):
         """
         self.fridge.shelves['recipe'][
             'all_params'] = self.recipe.get_all_params_copy()
-        try:
-            super().close_shop()
-        except AttributeError:
-            pass
 
     def to_dict(self):
         self.close_shop()
@@ -80,12 +83,6 @@ class BaseCook(ClassSaveLoadMixin):
 
 
 class LasagneTrainer(BaseCook):
-    def open_shop(self):
-        super().open_shop()
-        oven = self.oven
-        assert isinstance(oven, FullArrayBatchGenerator)
-        self.oven = oven
-
     def train(self, epochs) -> List[None]:
         for x, y in self.oven.iter_epoch(epochs):
             yield self.recipe.f_train(x, y)
@@ -203,12 +200,28 @@ class LasagneTrainer(BaseCook):
         self.box['train_error_hist'] = train_err_hist
 
 
-class CharmapMixin:
+@mixin_mock
+class CookMixinBase:
+    @mixin_mock
+    @property
+    def recipe(self) -> LasagneBase: return None
+
+    @mixin_mock
+    @property
+    def oven(self) -> FullArrayBatchGenerator: return None
+
+    @mixin_mock
+    @property
+    def fridge(self) -> BaseFridge: return None
+
+@mixin_mock
+class CharmapMixin(CookMixinBase):
+    @mixin_mock
+    @property
+    def oven(self) -> oven.CharmappedGeneratorMixin: return None
+
     def open_shop(self):
         super().open_shop()
-        _oven = self.oven
-        assert isinstance(_oven, oven.CharmappedGeneratorMixin)
-        self.oven = _oven
         if 'charmap' in self.fridge.shelves['oven']:
             self.oven.charmap = self.fridge.shelves['oven'].charmap
 
@@ -216,34 +229,25 @@ class CharmapMixin:
         super().close_shop()
         self.fridge.shelves['oven']['charmap'] = self.oven.charmap
 
-# noinspection PyUnresolvedReferences
-class LearningRateMixin:
-    def __init__(self, *args, **kwargs):
-        self._epochs = 0
-        super().__init__(*args, **kwargs)
+@mixin_mock
+class LearningRateMixin(CookMixinBase):
+    @mixin_mock
+    @property
+    def recipe(self) -> Union[LasagneBase, LCrecipe.LearningRateMixin]: return None
+    epochs_trained = MixinProp(default=0)
 
     def train(self, epochs) -> List[None]:
-        step = max(self._epochs - self.recipe.opt.start_epochs, 0)
-
-        for x, y in self.oven.iter_epoch(epochs, part='train'):
-            yield self.recipe.f_train(step=step)(x, y)
-        self._epochs += epochs
-
-    def train_err(self, batches):
-        for x, y in self.oven.iter_batch(batches, part='train'):
-            yield self.recipe.f_cost(x, y)
-
-    def val(self, epochs):
-        for x, y in self.oven.iter_epoch(epochs, part='val'):
-            yield self.recipe.f_cost(x, y)
-
-    def test(self, epochs):
-        for x, y in self.oven.iter_epoch(epochs, part='test'):
-            yield self.recipe.f_cost(x, y)
+        step = max(self.epochs_trained - self.opt.start_epochs, 0)
+        self.recipe.set_learning_rate(step=step)
+        yield from super().train(epochs)
+        self.epochs_trained += epochs
 
 
-# noinspection PyUnresolvedReferences
-class ResetStateMixin:
+class ResetStateMixin(CookMixinBase):
+    @mixin_mock
+    @property
+    def recipe(self) -> Union[LasagneBase, LCrecipe.LSTMStateReuse]: return None
+
     def train(self, *args, **kwargs) -> List[None]:
         self.recipe.reset_hidden_states()
         return super().train(*args, **kwargs)
@@ -253,7 +257,7 @@ class ResetStateMixin:
         return super().train_err(*args, **kwargs)
 
     def val(self, *args, **kwargs) -> List[None]:
-        #self.recipe.reset_hidden_states()
+        self.recipe.reset_hidden_states()
         return super().val(*args, **kwargs)
 
     def test(self, *args, **kwargs) -> List[None]:

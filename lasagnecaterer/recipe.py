@@ -25,7 +25,8 @@ class ScalarParameter:
     def opt_callback(self, instance, opt_name, value):
         self.__set__(instance, value)
 
-    def __init__(self, opt_name, spec_type=L.init.Constant, shape=None, default=0.0):
+    def __init__(self, opt_name, spec_type=L.init.Constant, shape=None,
+                 default=0.0):
         self.opt_name = opt_name
         self.spec_type = spec_type
         self.shape = shape
@@ -41,7 +42,8 @@ class ScalarParameter:
                 param = theano.shared(self.spec_type(init_val).sample((1,))[0])
             else:
                 spec = self.spec_type()
-                param = L.utils.create_param(spec, shape=self.shape, name=self.opt_name)
+                param = L.utils.create_param(spec, shape=self.shape,
+                                             name=self.opt_name)
 
             self.instances[instance] = (param, callback)
             opt.set_callback(self.opt_name, callback)
@@ -177,30 +179,38 @@ class LasagneBase(ChainedProps, ClassSaveLoadMixin,
     def compiled_function(self, *args, **kwargs):
         return theano.function(*args, **kwargs)
 
+    learning_rate = ScalarParameter('learning_rate', default=.002)
+
+    @property
+    def train_updates(self):
+        return L.updates.rmsprop(self.cost, self.all_train_params,
+                                 self.learning_rate)
+
     @property
     def f_train(self):
         """
         Compiled theano function that takes (x, y) and trains the lasagne
         Updates use default cost (e.g with dropout)
-        But f_train return the deterministic cost
+        But f_train returns the deterministic cost
         :return:
         """
-        updates = L.updates.rmsprop(self.cost, self.all_train_params, .002)
+
         return self.compiled_function([self.l_in.input_var, self.target_values],
-                               self.cost_det,
-                               updates=updates, allow_input_downcast=True)
+                                      self.cost_det,
+                                      updates=self.train_updates,
+                                      allow_input_downcast=True)
 
     @property
-    def f_train_noreturn(self):
+    def f_train_no_return(self):
         """
         Compiled theano function that takes (x, y) and trains the lasagne
         Updates use default cost (e.g with dropout)
         Does *not* return a cost.
         :return: None
         """
-        updates = L.updates.rmsprop(self.cost, self.all_train_params, .002)
         return self.compiled_function([self.l_in.input_var, self.target_values],
-                               updates=updates, allow_input_downcast=True)
+                                      updates=self.train_updates,
+                                      allow_input_downcast=True)
 
     @property
     def f_cost(self):
@@ -211,7 +221,7 @@ class LasagneBase(ChainedProps, ClassSaveLoadMixin,
         """
         self.all_train_params
         return self.compiled_function([self.l_in.input_var, self.target_values],
-                               self.cost_det, allow_input_downcast=True)
+                                      self.cost_det, allow_input_downcast=True)
 
     @property
     def f_predict(self, features):
@@ -225,7 +235,7 @@ class LasagneBase(ChainedProps, ClassSaveLoadMixin,
         output_transformed = self.predict_transform(resh)
         prediction = L.layers.get_output(output_transformed, deterministic=True)
         return self.compiled_function([self.l_in.input_var], prediction,
-                               allow_input_downcast=True)
+                                      allow_input_downcast=True)
 
     def predict_transform(self, x_next_fuzzy) -> T.Tensor:
         return x_next_fuzzy
@@ -245,17 +255,16 @@ class LasagneBase(ChainedProps, ClassSaveLoadMixin,
         # Take last prediction
         y_lay = L.layers.SliceLayer(resh, -1, axis=0)
 
-
         x_next_fuzzy_lay = L.layers.ReshapeLayer(y_lay, (1, features))
         x_next_lay = self.predict_transform(x_next_fuzzy_lay)
         x_next = L.layers.get_output(x_next_lay, deterministic=True)
         return self.compiled_function([self.l_in.input_var], x_next)
 
     @args_from_opt(2)
-    def auto_predict(self, x_next, n, features, sentinels: list=None):
+    def auto_predict(self, x_next, n, features, sentinels: list = None):
         for _ in range(n):
             x_next = x_next.reshape(1, -1, 1, features)
-            #self.reset_hidden_states(batched=False)
+            # self.reset_hidden_states(batched=False)
             x_next = self.f_predict_single(x_next)
             yield x_next
             if sentinels is not None:
@@ -279,11 +288,12 @@ class LasagneBase(ChainedProps, ClassSaveLoadMixin,
                 return x_next
         n_stepVar = T.iscalar()
 
-        (out_list, *_), updates = theano.scan(auropred, outputs_info=outputs_info,
-                                        n_steps=n_stepVar)
+        (out_list, *_), updates = theano.scan(auropred,
+                                              outputs_info=outputs_info,
+                                              n_steps=n_stepVar)
 
         f = self.compiled_function([self.l_in.input_var, n_stepVar], out_list,
-                               updates=updates)
+                                   updates=updates)
 
         def compiled_function_wrapper(x: np.matrix, n):
             x = x.reshape((1, -1, 1, features))
@@ -316,7 +326,8 @@ class LSTMBase(LasagneBase):
             super().__init__(incoming, name)
 
         def get_output_for(self, input, **kwargs):
-            return L.utils.one_hot(T.argmax(input, axis=self.axis), input.shape[self.axis])
+            return L.utils.one_hot(T.argmax(input, axis=self.axis),
+                                   input.shape[self.axis])
 
     @args_from_opt(1)
     def build_recurrent_layers(self, l_prev, n_hid_lay):
@@ -395,14 +406,15 @@ class RandomPredictMixin(MixinBase):
     pred_sigma = ScalarParameter('pred_sigma')
 
     class RandomOnehotLayer(L.layers.GaussianNoiseLayer):
-        def get_output_for(self, input, probabilistic=True,  **kwargs):
+        def get_output_for(self, input, probabilistic=True, **kwargs):
             if probabilistic:
                 if self.sigma:
-                    input = T.pow(input, self.sigma) # boost
+                    input = T.pow(input, self.sigma)  # boost
                 csum = T.cumsum(input, axis=1)
                 last_col = T.repeat(csum[:, -1:None], csum.shape[1], axis=1)
                 normed = csum / last_col
-                normed = T.concatenate([T.zeros((csum.shape[0], 1)), normed], axis=1)
+                normed = T.concatenate([T.zeros((csum.shape[0], 1)), normed],
+                                       axis=1)
                 rand = self._srng.uniform(input.shape[0:1]).reshape((-1, 1))
                 idx = T.repeat(rand, input.shape[1], axis=1)
 
@@ -413,7 +425,8 @@ class RandomPredictMixin(MixinBase):
 
     @args_from_opt(1)
     def predict_transform(self, l_out, pred_sigma=0):
-        return self.RandomOnehotLayer(l_out, sigma=self.pred_sigma, name='pred_trans')
+        return self.RandomOnehotLayer(l_out, sigma=self.pred_sigma,
+                                      name='pred_trans')
 
 
 class SSEMixin(MixinBase):
@@ -439,7 +452,8 @@ class SSEMixin(MixinBase):
         """
 
         l_shp = L.layers.ReshapeLayer(l_prev, (-1, n_hid_unit))
-        l_cat = L.layers.ConcatLayer([l_shp, L.layers.ReshapeLayer(self.l_in, (-1, features))])
+        l_cat = L.layers.ConcatLayer(
+            [l_shp, L.layers.ReshapeLayer(self.l_in, (-1, features))])
         return L.layers.DenseLayer(l_cat, num_units=features)
 
     def predict_transform(self, l_out) -> L.layers.Layer:
@@ -452,6 +466,7 @@ class LSTMStateReuse(LSTMBase):
         Copy of standard lasagne.layers.LSTMLayer
         with overwritten get_output_for such that it returns cell state
         """
+
         def get_output_for(self, inputs, **kwargs):
             """
             Compute this layer's output function given a symbolic input variable
@@ -488,7 +503,6 @@ class LSTMStateReuse(LSTMBase):
             # a couple of local imports
             unroll_scan = L.utils.unroll_scan
             Layer = L.layers.Layer
-
 
             # Retrieve the layer input
             input = inputs[0]
@@ -540,7 +554,7 @@ class LSTMStateReuse(LSTMBase):
             # the input values for a time step
             # We define a slicing function that extract the input to each LSTM gate
             def slice_w(x, n):
-                return x[:, n*self.num_units:(n+1)*self.num_units]
+                return x[:, n * self.num_units:(n + 1) * self.num_units]
 
             # Create single recurrent computation step function
             # input_n is the n'th vector of the input
@@ -564,8 +578,8 @@ class LSTMStateReuse(LSTMBase):
 
                 if self.peepholes:
                     # Compute peephole connections
-                    ingate += cell_previous*self.W_cell_to_ingate
-                    forgetgate += cell_previous*self.W_cell_to_forgetgate
+                    ingate += cell_previous * self.W_cell_to_ingate
+                    forgetgate += cell_previous * self.W_cell_to_forgetgate
 
                 # Apply nonlinearities
                 ingate = self.nonlinearity_ingate(ingate)
@@ -573,17 +587,18 @@ class LSTMStateReuse(LSTMBase):
                 cell_input = self.nonlinearity_cell(cell_input)
 
                 # Compute new cell value
-                cell = forgetgate*cell_previous + ingate*cell_input
+                cell = forgetgate * cell_previous + ingate * cell_input
 
                 if self.peepholes:
-                    outgate += cell*self.W_cell_to_outgate
+                    outgate += cell * self.W_cell_to_outgate
                 outgate = self.nonlinearity_outgate(outgate)
 
                 # Compute new hidden unit activation
-                hid = outgate*self.nonlinearity(cell)
+                hid = outgate * self.nonlinearity(cell)
                 return [cell, hid]
 
-            def step_masked(input_n, mask_n, cell_previous, hid_previous, *args):
+            def step_masked(input_n, mask_n, cell_previous, hid_previous,
+                            *args):
                 cell, hid = step(input_n, cell_previous, hid_previous, *args)
 
                 # Skip over any input with mask 0 by copying the previous
@@ -715,9 +730,9 @@ class LSTMStateReuse(LSTMBase):
 
         @classmethod
         def from_weak_dict(cls, hidden_states: WeakKeyDictionary):
-            return cls((id(layer), param.get_value()) for layer, (param, update) in
+            return cls(
+                (id(layer), param.get_value()) for layer, (param, update) in
                 hidden_states.items())
-
 
     def set_hidden_state(self, checkpoint: HiddenStates):
         for layer, (param, update) in self.hidden_state_updates.items():
@@ -731,11 +746,11 @@ class LSTMStateReuse(LSTMBase):
 
         states = L.layers.get_output(list(self.hidden_state_updates.keys()))
         return theano.function(list(), outputs=states)
-        #for layer, (param, update) in zip(self.hidden_state_updates.items()):
-
+        # for layer, (param, update) in zip(self.hidden_state_updates.items()):
 
     @args_from_opt(1)
-    def make_recurrent_layer(self, l_prev, batch_sz, seq_len, n_hid_unit, grad_clip=100,
+    def make_recurrent_layer(self, l_prev, batch_sz, seq_len, n_hid_unit,
+                             grad_clip=100,
                              unroll=False):
         state_shape = (batch_sz, n_hid_unit)
         h_param = L.utils.create_param(L.init.Constant(0.0), state_shape,
@@ -775,70 +790,15 @@ class LSTMStateReuse(LSTMBase):
 
 
 class LearningRateMixin(MixinBase):
-    @property
-    def f_train_alpha_noreturn(self, decay=.95):
-        """
-        Compiled theano training function that also takes a learning rate parameter
-        as well as x and y (alpha, x, y)
-        :param decay:
-        :return:
-        """
-        alphaVar = T.fscalar()
-        updates = L.updates.rmsprop(self.cost, self.all_train_params, alphaVar)
-        return self.compiled_function(
-            [alphaVar, self.l_in.input_var, self.target_values],
-            updates=updates, allow_input_downcast=True)
-
-    @property
-    def f_train_alpha(self, decay=.95):
-        """
-        Compiled theano training function that also takes a learning rate parameter
-        as well as x and y (alpha, x, y)
-        :param decay:
-        :return:
-        """
-        alphaVar = T.fscalar()
-        updates = L.updates.rmsprop(self.cost, self.all_train_params, alphaVar)
-        return self.compiled_function(
-            [alphaVar, self.l_in.input_var, self.target_values], self.cost_det,
-            updates=updates, allow_input_downcast=True)
-
-    @lru_cache()
     @args_from_opt(2)
-    def f_train_noreturn(self, alpha=None, step=None,
+    def set_learning_rate(self, alpha=None, step=None,
                          start_alpha=(2 * 10 ** (-3)), alpha_factor=.95):
-        """
-        produce wrapped f_train_alpha.
-        wrapped f_train can be called without alpha parameter
-        :param alpha: the learning rate to use. None -> default
-        :param step: calculate learningrate from  start_alpha * alpha_factor ** step
-        :return: partial function
-        """
-        f = self.f_train_alpha_noreturn
         if alpha is None:
             alpha = start_alpha * alpha_factor ** step
-        print("learning rate: " + str(alpha))
-        return partial(f, alpha)
-
-    @lru_cache()
-    @args_from_opt(2)
-    def f_train(self, alpha=None, step=None,
-                         start_alpha=(2 * 10 ** (-3)), alpha_factor=.95):
-        """
-        produce wrapped f_train_alpha.
-        wrapped f_train can be called without alpha parameter
-        :param alpha: the learning rate to use. None -> default
-        :param step: calculate learningrate from  start_alpha * alpha_factor ** step
-        :return: partial function
-        """
-        f = self.f_train_alpha
-        if alpha is None:
-            alpha = start_alpha * alpha_factor ** step
-        print("learning rate: " + str(alpha))
-        return partial(f, alpha)
+        self.learning_rate = alpha
 
 
-class DropoutMixin(MixinBase):
+class DropoutMixinBase(MixinBase):
     @args_from_opt(1)
     def apply_dropout(self, l_prev, specific_dropout=None, dropout=.5):
         if specific_dropout is None:
@@ -846,20 +806,20 @@ class DropoutMixin(MixinBase):
         return L.layers.DropoutLayer(l_prev, p=specific_dropout)
 
 
-class DropoutInMixin(DropoutMixin):
+class DropoutInMixin(DropoutMixinBase):
     @property
     def l_bottom(self, dropout_in=None):
         return self.apply_dropout(super().l_bottom, specific_dropout=dropout_in)
 
 
-class DropoutOutMixin(DropoutMixin):
+class DropoutOutMixin(DropoutMixinBase):
     @property
     def l_top(self, dropout_out=None):
         return self.apply_dropout(super().l_top, specific_dropout=dropout_out)
 
 
 # noinspection PyUnresolvedReferences
-class DropoutBetweenMixin(DropoutMixin):
+class DropoutBetweenMixin(DropoutMixinBase):
     """
     Apply dropout between two consecutive recurrent layers
     """
@@ -882,21 +842,3 @@ class DropoutBetweenMixin(DropoutMixin):
                                             specific_dropout=dropout_mid)
 
         return l_prev
-
-
-class LSTMDropout(LearningRateMixin, DropoutInMixin, DropoutOutMixin, LSTMBase):
-    pass
-
-
-class LSTMKarpath(LearningRateMixin, DropoutOutMixin, DropoutBetweenMixin,
-                  LSTMStateReuse):
-    pass
-
-"""
-class LSTMDropoutLR(DropoutInOutMixin, LearningRateMixin, LSTMBase):
-    @property
-    def f_grad(self):
-        g = theano.grad(self.cost, self.all_params)
-        return theano.function([self.l_in.input_var, self.target_values],
-                               [self.cost] + g, allow_input_downcast=True)
-"""

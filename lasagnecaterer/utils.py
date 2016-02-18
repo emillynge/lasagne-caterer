@@ -7,11 +7,13 @@ import os
 from collections import namedtuple, OrderedDict, deque, Generator, defaultdict, \
     MutableSequence, UserDict
 from operator import attrgetter, itemgetter
-from typing import Union, List
+from typing import Union, List, Any
 import re
 import sys
 import asyncio
 import warnings
+from weakref import WeakKeyDictionary
+
 from decorator import contextmanager
 from functools import singledispatch, partial
 from subprocess import Popen, PIPE
@@ -84,7 +86,7 @@ def force_seek(inp: ioabc.InputStream) -> ioabc.SeekableInputStream:
 def any_to_char_stream(inp: Union[str, ioabc.InputStream, bytes],
                        output_type: Union[str, bytes] = str,
                        force_seekable=False) -> Union[ioabc.InputStream,
-                                                 ioabc.SeekableInputStream]:
+                                                      ioabc.SeekableInputStream]:
     """
     Transfrom any kind of input into a
     :param inp:
@@ -172,6 +174,124 @@ from abc import ABCMeta
 
 class ChainPropsABCMetaclass(ChainedPropsMetaClass, ABCMeta):
     pass
+
+
+class MixinProp(property):
+    """
+    Descriptor for use with mixins to to avoid calling __init__
+    """
+
+    def __init__(self, default=0.0, super_call=None, return_type=Any):
+        self.default = default
+        self.super_call = super_call
+        self.return_type = return_type
+        self.owners = WeakKeyDictionary()
+        self.instances = WeakKeyDictionary()
+
+    def _get_super(self, instance, obj_type):
+        try:
+            result = getattr(super(obj_type, instance), self.super_call)
+        except AttributeError:
+            parents = [klass.__qualname__ for klass in obj_type.__mro__[1:]]
+            raise AttributeError('A mixin requires {0} to have an attribute'
+                                 '{1} in one of the parents classes:'
+                                 '\n {2}'.format(instance, parents,
+                                                 self.super_call))
+
+        if self.return_type is Any:
+            return result
+        try:
+            assert isinstance(result, self.return_type)
+            return result
+        except AssertionError:
+            raise AssertionError('A mixin expects return type of {0}'
+                                 'to be an instance of {1}.'
+                                 ' it was found to be {2}'.format(
+                self.super_call,
+                self.return_type,
+                type(result)))
+
+    def __get__(self, instance, obj_type):
+        if self.super_call:
+            return self._get_super(instance, obj_type)
+        if instance not in self.instances:
+            self.instances[instance] = self.default
+        return self.instances[instance]
+
+    def __set__(self, instance, value):
+        if self.super_call:
+            raise NotImplementedError
+        self.instances[instance] = value
+
+
+class MixinRequires:
+    """
+    def __init__(self, super_call, return_type=Any):
+        self.super_call = super_call
+        self.return_type = return_type
+        self.owners = WeakKeyDictionary()
+        self.instances = WeakKeyDictionary()
+        for methodname, method in return_type.__dict__:
+            setattr(self, methodname, method)
+
+    def __get__(self, instance, owner):
+        try:
+            result = getattr(super(owner, instance), self.super_call)
+        except AttributeError:
+            parents = [klass.__qualname__ for klass in owner.__mro__[1:]]
+            raise AttributeError('A mixin requires {0} to have an attribute'
+                                 '{1} in one of the parents classes:'
+                                 '\n {2}'.format(instance, parents,
+                                                 self.super_call))
+
+        if self.return_type is Any:
+            return result
+        try:
+            assert isinstance(result, self.return_type)
+            return result
+        except AssertionError:
+            raise AssertionError('A mixin expects return type of {0}'
+                                 'to be an instance of {1}.'
+                                 ' it was found to be {2}'.format(
+                self.super_call,
+                self.return_type,
+                type(result)))
+    """
+
+    @classmethod
+    def mixin_decorator(cls, mixin_cls):
+        remove = list()
+        for name, attr in mixin_cls.__dict__.items():
+            if isinstance(attr, type):
+                if issubclass(attr, cls):
+                    remove.append(name)
+
+        for remname in remove:
+            delattr(mixin_cls, remname)
+        return mixin_cls
+
+    @classmethod
+    def mock(cls, mock_classes, _=None):
+        try:
+            assert isinstance(_, mock_classes)
+            return _
+        except AssertionError:
+            return cls
+
+
+def mixin_mock(obj):
+    if isinstance(obj, property):
+        return obj.setter('mocked')
+
+    else:
+        remove = list()
+        for name, attr in obj.__dict__.items():
+            if isinstance(attr, property) and attr.fset == 'mocked':
+                remove.append(name)
+
+        for remname in remove:
+            delattr(obj, remname)
+        return obj
 
 
 class Message(Widget):
@@ -303,11 +423,11 @@ class BokehConsole:
 
     def _push_lines(self, lines):
         l = len(lines)
-        if self._pos == -1: # lines come in from bottom
+        if self._pos == -1:  # lines come in from bottom
             for i, line in enumerate(lines):
                 self.line_buffer[i] = line
             self.line_buffer.rotate(self._rotate * l)
-        else:   # lines come in from top
+        else:  # lines come in from top
             self.line_buffer.rotate(self._rotate * l)
             for i, line in enumerate(lines):
                 self.line_buffer[i] = line
@@ -333,7 +453,6 @@ class BokehConsole:
                         tokens.append(token)
                 lines.append(' '.join(tokens))
         self._push_lines(lines)
-
 
 
 JobProgress = namedtuple('JobProgress', 'name percent state')
@@ -1380,4 +1499,3 @@ class IDContext:
     def __exit__(self, exc_type, exc, tb):
         self.semaphore.ids.append(self.id)
         self.semaphore.release()
-
