@@ -14,6 +14,7 @@ def main():
     fr = get_fridge()
     # boot up!
     fr.bootstrap()
+    return fr
 
 if __name__ == '__main__':
-    main()
+    fr = main()

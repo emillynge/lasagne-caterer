@@ -33,31 +33,47 @@ class ScalarParameter:
         self.default = default
         self.instances = WeakKeyDictionary()
 
+    def make_param(self, instance, set_val=None):
+        opt = instance.opt
+        callback = partial(self.opt_callback, instance)
+        init_val = set_val if set_val is not None else opt.get(self.opt_name,
+                                                            self.default)
+        if not self.shape:
+            param = theano.shared(self.spec_type(init_val).sample((1,))[0])
+        else:
+            spec = self.spec_type()
+            param = L.utils.create_param(spec, shape=self.shape,
+                                         name=self.opt_name)
+        opt.set_callback(self.opt_name, callback)
+        return param, callback
+
     def __get__(self, instance: ChainedProps, obj_type):
         if instance not in self.instances:
-            opt = instance.opt
-            callback = partial(self.opt_callback, instance)
-            init_val = opt.get(self.opt_name, self.default)
-            if not self.shape:
-                param = theano.shared(self.spec_type(init_val).sample((1,))[0])
-            else:
-                spec = self.spec_type()
-                param = L.utils.create_param(spec, shape=self.shape,
-                                             name=self.opt_name)
-
-            self.instances[instance] = (param, callback)
-            opt.set_callback(self.opt_name, callback)
+            self.instances[instance] = self.make_param(instance)
         return self.instances[instance][0]
 
     def __set__(self, instance, value):
+        if instance not in self.instances:
+            self.instances[instance] = self.make_param(instance)
         self.instances[instance][0].set_value(value)
 
 
-class MixinBase(metaclass=ChainPropsABCMetaclass): pass
+class OneHotLayer(L.layers.Layer):
+    def __init__(self, incoming, axis=0, name=None):
+        self.axis = axis
+        super().__init__(incoming, name)
+
+    def get_output_for(self, input, **kwargs):
+        return L.utils.one_hot(T.argmax(input, axis=self.axis),
+                               input.shape[self.axis])
 
 
 class LasagneBase(ChainedProps, ClassSaveLoadMixin,
                   metaclass=ChainPropsABCMetaclass):
+    def __init__(self, *args, **kwargs):
+        super(LasagneBase, self).__init__(*args, **kwargs)
+        self.saved_params = None
+
     @property
     def l_in(self, features, win_sz=1):
         """
@@ -119,14 +135,8 @@ class LasagneBase(ChainedProps, ClassSaveLoadMixin,
 
         return L.layers.ReshapeLayer(self.l_out_flat, (-1, seq_len, features))
 
-    @property
-    def saved_params(self):
-        """
-        A property to hold saved parameters that should be used to initialize
-        :return: None by default. But will can be set by a cook at .open_shop()
-        if any aparams exists in in the recipe tupperware
-        """
-        return None
+    def reset_params(self):
+        self.init_params(None)
 
     def init_params(self, saved_params):
         if saved_params:
@@ -176,7 +186,8 @@ class LasagneBase(ChainedProps, ClassSaveLoadMixin,
                                                deterministic=True)
         return self.cost_metric(flattened_output)
 
-    def compiled_function(self, *args, **kwargs):
+    def compiled_function(self, *args, givens=tuple(), **kwargs):
+        kwargs['givens'] = list(givens)# + [self.learning_rate]
         return theano.function(*args, **kwargs)
 
     learning_rate = ScalarParameter('learning_rate', default=.002)
@@ -236,9 +247,6 @@ class LasagneBase(ChainedProps, ClassSaveLoadMixin,
         prediction = L.layers.get_output(output_transformed, deterministic=True)
         return self.compiled_function([self.l_in.input_var], prediction,
                                       allow_input_downcast=True)
-
-    def predict_transform(self, x_next_fuzzy) -> T.Tensor:
-        return x_next_fuzzy
 
     @property
     def f_predict_single(self, features):
@@ -310,6 +318,9 @@ class LasagneBase(ChainedProps, ClassSaveLoadMixin,
         """
         raise NotImplementedError
 
+    def predict_transform(self, l_top: L.layers.Layer, l_out_flat: L.layers.Layer) -> L.layers.Layer:
+        raise NotImplementedError
+
     def cost_metric(self, flattened_output, features):
         """
         apply a metric of cost to flattened output with given number of features
@@ -320,6 +331,89 @@ class LasagneBase(ChainedProps, ClassSaveLoadMixin,
 
 
 class LSTMBase(LasagneBase):
+    @args_from_opt(1)
+    def build_recurrent_layers(self, l_prev, n_hid_lay):
+        """
+        Construct a number of LSTM layers taking l_prev as bottom input
+        :param l_prev:
+        :param n_hid_lay:
+        :return:
+        """
+        for i in range(n_hid_lay):
+            print('LSTM-in', i, l_prev.output_shape)
+            l_prev = self.make_recurrent_layer(l_prev)
+        return l_prev
+
+    @args_from_opt(1)
+    def make_recurrent_layer(self, l_prev, n_hid_unit, grad_clip=5):
+        return L.layers.LSTMLayer(l_prev, n_hid_unit,
+                                  grad_clipping=grad_clip,
+                                  nonlinearity=L.nonlinearities.tanh)
+
+    @args_from_opt(1)
+    def out_transform(self, l_prev, n_hid_unit, features):
+        """
+        Apply non-linear transform to l_prev
+        :param l_prev:
+        :param n_hid_unit:
+        :param features:
+        :return:
+        """
+        l_shp = L.layers.ReshapeLayer(l_prev, (-1, n_hid_unit))
+        return L.layers.DenseLayer(l_shp, num_units=features,
+                                   nonlinearity=L.nonlinearities.softmax)
+
+    @property
+    def l_top(self, n_hid_unit, n_hid_lay):
+        """
+        fit LSTM layers in between bottom and top
+        :return:
+        """
+        return self.build_recurrent_layers(self.l_bottom)
+
+    @args_from_opt(1)
+    def init_params(self, saved_params, W_range=0.08):
+        """
+        initialize all parameters to uniform in +-W_range
+        :param W_range:
+        :return:
+        """
+        if saved_params:
+            super().init_params(saved_params)
+        else:
+            w_init = L.init.Uniform(range=W_range)
+            new_params = [w_init.sample(w.shape) for w
+                          in self.get_all_params_copy()]
+
+            self.set_all_params(new_params)
+
+    cost_stability = ScalarParameter('cost_stability', default=1e-6)
+
+    @args_from_opt(1)
+    def cost_metric(self, flattened_output, features):
+        """
+        Cross entropy cost metric
+        :param flattened_output:
+        :param features:
+        :return:
+        """
+        normed_output = flattened_output * (1 - 2 * self.cost_stability) + self.cost_stability
+
+        return T.nnet.categorical_crossentropy(normed_output,
+                                               self.target_values.reshape(
+                                                   (-1, features))).mean()
+
+    def compiled_function(self, *args, givens=tuple(), **kwargs):
+        kwargs['givens'] = list(givens)# + [self.cost_stability]
+        return super(LSTMBase, self).compiled_function(*args, **kwargs)
+
+    @args_from_opt(2)
+    def predict_transform(self, l_top: L.layers.Layer,
+                          l_out_flat: L.layers.DenseLayer, n_hid_unit) -> L.layers.Layer:
+        return OneHotLayer(l_out_flat, axis=1, name='onehot_pred')
+
+
+class GRUBase(LasagneBase):
     class OneHotLayer(L.layers.Layer):
         def __init__(self, incoming, axis=0, name=None):
             self.axis = axis
@@ -338,13 +432,13 @@ class LSTMBase(LasagneBase):
         :return:
         """
         for i in range(n_hid_lay):
-            print('LSTM-in', i, l_prev.output_shape)
+            print('GRU-in', i, l_prev.output_shape)
             l_prev = self.make_recurrent_layer(l_prev)
         return l_prev
 
     @args_from_opt(1)
-    def make_recurrent_layer(self, l_prev, n_hid_unit, grad_clip=100):
-        return L.layers.LSTMLayer(l_prev, n_hid_unit,
+    def make_recurrent_layer(self, l_prev, n_hid_unit, grad_clip=5):
+        return L.layers.GRULayer(l_prev, n_hid_unit,
                                   grad_clipping=grad_clip,
                                   nonlinearity=L.nonlinearities.tanh)
 
@@ -397,13 +491,24 @@ class LSTMBase(LasagneBase):
                                                self.target_values.reshape(
                                                    (-1, features))).mean()
 
-    @args_from_opt(1)
-    def predict_transform(self, l_out):
-        return self.OneHotLayer(l_out, axis=1, name='onehot')
+    @args_from_opt(2)
+    def predict_transform(self, l_top: L.layers.Layer,
+                          l_out_flat: L.layers.DenseLayer, n_hid_unit) -> L.layers.Layer:
+        return OneHotLayer(l_out_flat, axis=1, name='onehot_pred')
+
+
+class MixinBase(metaclass=ChainPropsABCMetaclass): pass
 
 
 class RandomPredictMixin(MixinBase):
     pred_sigma = ScalarParameter('pred_sigma')
+
+    class ScaledSoftmax:
+        def __init__(self, scale=1):
+            self.scale = scale
+
+        def __call__(self, x):
+            return T.nnet.softmax(x * self.scale)
 
     class RandomOnehotLayer(L.layers.GaussianNoiseLayer):
         def get_output_for(self, input, probabilistic=True, **kwargs):
@@ -424,10 +529,108 @@ class RandomPredictMixin(MixinBase):
                 return L.utils.one_hot(T.argmax(input, axis=1), input.shape[1])
 
     @args_from_opt(1)
-    def predict_transform(self, l_out, pred_sigma=0):
+    def predict_transform(self, l_top, pred_sigma=0):
         return self.RandomOnehotLayer(l_out, sigma=self.pred_sigma,
                                       name='pred_trans')
 
+
+class DebugMixin(MixinBase):
+    rho = ScalarParameter('rho', default=0.9)
+    epsilon = ScalarParameter('epsilon', default=1e-6)
+
+    def update_debug(self, loss, params):
+        grads = L.updates.get_or_compute_grads(loss, params)
+        debug_info = OrderedDict()
+        learning_rate = self.learning_rate
+        rho = self.rho
+        epsilon = self.epsilon
+        init_params = OrderedDict(rho=rho, epsilon=epsilon, leaning_rate=learning_rate,
+                                  loss=loss)
+        debug_info['init_params'] = init_params
+        for param, grad in zip(params, grads):
+            calculations = OrderedDict()
+
+            value = param.get_value(borrow=True)
+            accu = theano.shared(np.zeros(value.shape, dtype=value.dtype),
+                                 broadcastable=param.broadcastable)
+            calculations['accu'] = accu
+            calculations['rho * accu'] = rho * accu
+            calculations['(1 - rho) * grad ** 2'] = (1 - rho) * grad ** 2
+
+            calculations['accu_new'] = rho * accu + (1 - rho) * grad ** 2
+            calculations['param'] = param
+            calculations['grad'] = grad
+            calculations['accu_new + epsilon'] = calculations['accu_new'] + epsilon
+            calculations['T.sqrt(accu_new + epsilon)'] = T.sqrt(calculations['accu_new'] + epsilon)
+            calculations['new_param'] = param - (learning_rate * grad /
+                                      T.sqrt(calculations['accu_new'] + epsilon))
+            debug_info[param] = calculations
+
+        return debug_info
+
+    def f_train_hidden_states(self):
+        return self.compiled_function([self.l_in.input_var, self.target_values],
+                                      [self.cost_det],
+                                      updates=self.train_updates,
+                                      allow_input_downcast=True,
+                                      )
+
+
+    def unpack_debug_info(self, debug_info, computed=tuple()):
+        computed = list(computed)
+        computed.reverse()
+        for key, value in debug_info.items():
+            if computed:
+                name = key.name if hasattr(key, 'name') else str(key)
+                print('#' * 10 + name + '#'*10)
+            for kkey, vvalue in value.items():
+                if computed:
+                    nname = kkey.name if hasattr(kkey, 'name') else str(kkey)
+                    print('-'*10 + nname + '-'*10)
+                    print(computed.pop())
+                    print('-'*20)
+                else:
+                    yield vvalue
+
+    @property
+    def debug_info(self):
+        return self.update_debug(self.cost, self.all_train_params)
+
+    @staticmethod
+    def detect_nan(i, node, fn):
+        for output in fn.outputs:
+            if (not isinstance(output[0], np.random.RandomState) and
+                    (np.isnan(output[0]).any() or np.isinf(output[0]).any())):
+                print('*** NaN detected ***')
+                theano.printing.debugprint(node)
+                print('Inputs : %s' % [input[0] for input in fn.inputs])
+                print('Outputs: %s' % [output[0] for output in fn.outputs])
+                raise ZeroDivisionError
+
+
+    @property
+    def f_train_debug(self):
+        values = list(self.unpack_debug_info(self.debug_info))
+        return self.compiled_function([self.l_in.input_var, self.target_values],
+                                      [self.cost_det, self.cost] + values,
+                                      updates=self.train_updates,
+                                      allow_input_downcast=True,
+                                      )
+    @property
+    def f_train_detect_nan(self):
+        from theano.compile.nanguardmode import NanGuardMode
+        return self.compiled_function([self.l_in.input_var, self.target_values],
+                                [self.cost_det], updates=self.train_updates,
+                               mode=NanGuardMode(True, True, True))
+
+
+    @property
+    def f_grad_detect_nan(self):
+        grads = L.updates.get_or_compute_grads(self.cost, self.all_train_params)
+        return self.compiled_function([self.l_in.input_var, self.target_values],
+                               grads + [self.cost_det, self.cost, L.layers.get_output(self.l_out)],
+                               mode=theano.compile.MonitorMode(
+                                      post_func=self.detect_nan))
 
 class SSEMixin(MixinBase):
     @args_from_opt(1)
@@ -460,7 +663,143 @@ class SSEMixin(MixinBase):
         return l_out
 
 
-class LSTMStateReuse(LSTMBase):
+class StateReuseMixin(MixinBase):
+    class OutputSplitLayer(L.layers.Layer):
+        def __init__(self, input_layer: L.layers.MergeLayer, name=None):
+            super().__init__(input_layer, name=name)
+            self.input_layer = input_layer
+
+        def get_output_shape_for(self, input_shape):
+            return input_shape
+
+        def get_output_for(self, input, **kwargs):
+            hid_out, *_ = input
+
+            # When it is requested that we only return the final sequence step,
+            # we need to slice it out immediately after scan is applied
+            if self.input_layer.only_return_final:
+                hid_out = hid_out[-1]
+            else:
+                # dimshuffle back to (n_batch, n_time_steps, n_features))
+                hid_out = hid_out.dimshuffle(1, 0, 2)
+
+                # if scan is backward reverse the output
+                if self.input_layer.backwards:
+                    hid_out = hid_out[:, ::-1]
+            return hid_out
+
+    class ExtractLastStates(L.layers.Layer):
+        def __init__(self, input_layer: L.layers.MergeLayer, name=None):
+            super().__init__(input_layer, name=name)
+            self.input_layer = input_layer
+
+        def get_output_for(self, input, **kwargs):
+            if self.input_layer.backwards:
+                return tuple(state[0] for state in input)
+            return tuple(state[-1] for state in input)
+
+    @property
+    def hidden_state_updates(self):
+        return WeakKeyDictionary()
+
+    @args_from_opt('batched')
+    def reset_hidden_states(self, batched=True, batch_sz=None, n_hid_unit=None):
+        if batched:
+            zeros = np.zeros((batch_sz, n_hid_unit), dtype=np.float32)
+        else:
+            zeros = np.zeros((1, n_hid_unit), dtype=np.float32)
+
+        for layer, (param, update) in self.hidden_state_updates.items():
+            param.set_value(zeros)
+
+    class HiddenStates(OrderedDict, SaveLoadZipFilemixin):
+        def __iter__(self):
+            return self.keys()
+
+        def from_dict(cls, *args, **kwargs):
+            return cls(kwargs)
+
+        def to_dict(self) -> OrderedDict:
+            return self
+
+        def bootstrap(self):
+            pass
+
+        @classmethod
+        def from_weak_dict(cls, hidden_states: WeakKeyDictionary):
+            return cls(
+                (id(layer), param.get_value()) for layer, (param, update) in
+                hidden_states.items())
+
+    def set_hidden_state(self, checkpoint: HiddenStates):
+        for layer, (param, update) in self.hidden_state_updates.items():
+            param.set_value(checkpoint[id(layer)])
+
+    def get_hidden_state(self) -> HiddenStates:
+        return self.HiddenStates.from_weak_dict(self.hidden_state_updates)
+
+    @property
+    def f_print_hidden(self):
+
+        states = L.layers.get_output(list(self.hidden_state_updates.keys()))
+        return theano.function(list(), outputs=states)
+        # for layer, (param, update) in zip(self.hidden_state_updates.items()):
+
+    @args_from_opt(1)
+    def make_recurrent_layer(self, l_prev, batch_sz, seq_len, n_hid_unit,
+                             unroll=False):
+        state_shape = (batch_sz, n_hid_unit)
+        state_params = [L.utils.create_param(L.init.Constant(0.0), state_shape,
+                                       name=name + '_param') for name in self.state_names]
+
+        state_in_layers = [L.layers.InputLayer((batch_sz, n_hid_unit),
+                                             input_var=param, name=name + '_lay')
+                         for param, name in zip(state_params, self.state_names)]
+
+        if unroll:
+            sys.setrecursionlimit(int(2000 + batch_sz * seq_len))
+        raw_lay = self._make_recurrent_layer(l_prev, state_in_layers)
+        return_lay = self.OutputSplitLayer(raw_lay, name='return')
+        last_state_lay = self.ExtractLastStates(raw_lay, name='last_states')
+
+        last_states = L.layers.get_output(last_state_lay)
+        for _in, last, param in zip(state_in_layers, last_states, state_params):
+            self.hidden_state_updates[_in] = (param, last)
+        return return_lay
+
+    def _make_recurrent_layer(self, l_prev, state_layers):
+        raise NotImplementedError
+
+    @property
+    def state_names(self) -> tuple:
+        raise NotImplementedError
+
+    def compiled_function(self, *args, updates=tuple(), **kwargs):
+
+        if isinstance(updates, dict):
+            updates = updates.items()
+
+        kwargs['updates'] = list(updates) + list(self.hidden_state_updates.values())
+        return super().compiled_function(*args, **kwargs)
+
+
+class LSTMStateReuseMixin(StateReuseMixin):
+    @property
+    def state_names(self) -> tuple:
+        return 'cell', 'hidden'
+
+    @args_from_opt(2)
+    def _make_recurrent_layer(self, l_prev, state_layers, n_hid_unit,
+                              grad_clip=5, unroll=False):
+        cell_lay, hid_lay = state_layers
+        raw_lay = self.LSTMLayer(l_prev, n_hid_unit,
+                                 hid_init=hid_lay, cell_init=cell_lay,
+                                 grad_clipping=grad_clip,
+                                 nonlinearity=L.nonlinearities.tanh,
+                                 name='LSTM_raw',
+                                 unroll_scan=unroll)
+        return raw_lay
+
     class LSTMLayer(L.layers.LSTMLayer):
         """
         Copy of standard lasagne.layers.LSTMLayer
@@ -663,130 +1002,196 @@ class LSTMStateReuse(LSTMBase):
                     truncate_gradient=self.gradient_steps,
                     non_sequences=non_seqs,
                     strict=True)[0]
-            return cell_out, hid_out
+            return hid_out, cell_out
 
-    class ExtractLSTMOut(L.layers.Layer):
-        def __init__(self, input_layer: L.layers.LSTMLayer, name=None):
-            super().__init__(input_layer, name=name)
-            self.input_layer = input_layer
 
-        def get_output_shape_for(self, input_shape):
-            return input_shape
-
-        def get_output_for(self, input, **kwargs):
-            cell_out, hid_out = input
-
-            # When it is requested that we only return the final sequence step,
-            # we need to slice it out immediately after scan is applied
-            if self.input_layer.only_return_final:
-                hid_out = hid_out[-1]
-            else:
-                # dimshuffle back to (n_batch, n_time_steps, n_features))
-                hid_out = hid_out.dimshuffle(1, 0, 2)
-
-                # if scan is backward reverse the output
-                if self.input_layer.backwards:
-                    hid_out = hid_out[:, ::-1]
-
-            return hid_out
-
-    class ExtractLastStates(L.layers.Layer):
-        def __init__(self, input_layer: L.layers.LSTMLayer, name=None):
-            super().__init__(input_layer, name=name)
-            self.input_layer = input_layer
-
-        def get_output_for(self, input, **kwargs):
-            cell_out, hid_out = input
-            if self.input_layer.backwards:
-                return hid_out[0], cell_out[0]
-            return cell_out[-1], hid_out[-1]
-
+class GRUStateReuseMixin(StateReuseMixin):
     @property
-    def hidden_state_updates(self):
-        return WeakKeyDictionary()
+    def state_names(self) -> tuple:
+        return 'hidden'
 
-    @args_from_opt('batched')
-    def reset_hidden_states(self, batched=True, batch_sz=None, n_hid_unit=None):
-        if batched:
-            zeros = np.zeros((batch_sz, n_hid_unit), dtype=np.float32)
-        else:
-            zeros = np.zeros((1, n_hid_unit), dtype=np.float32)
-
-        for layer, (param, update) in self.hidden_state_updates.items():
-            param.set_value(zeros)
-
-    class HiddenStates(OrderedDict, SaveLoadZipFilemixin):
-        def __iter__(self):
-            return self.keys()
-
-        def from_dict(cls, *args, **kwargs):
-            return cls(kwargs)
-
-        def to_dict(self) -> OrderedDict:
-            return self
-
-        def bootstrap(self):
-            pass
-
-        @classmethod
-        def from_weak_dict(cls, hidden_states: WeakKeyDictionary):
-            return cls(
-                (id(layer), param.get_value()) for layer, (param, update) in
-                hidden_states.items())
-
-    def set_hidden_state(self, checkpoint: HiddenStates):
-        for layer, (param, update) in self.hidden_state_updates.items():
-            param.set_value(checkpoint[id(layer)])
-
-    def get_hidden_state(self) -> HiddenStates:
-        return self.HiddenStates.from_weak_dict(self.hidden_state_updates)
-
-    @property
-    def f_print_hidden(self):
-
-        states = L.layers.get_output(list(self.hidden_state_updates.keys()))
-        return theano.function(list(), outputs=states)
-        # for layer, (param, update) in zip(self.hidden_state_updates.items()):
-
-    @args_from_opt(1)
-    def make_recurrent_layer(self, l_prev, batch_sz, seq_len, n_hid_unit,
-                             grad_clip=100,
-                             unroll=False):
-        state_shape = (batch_sz, n_hid_unit)
-        h_param = L.utils.create_param(L.init.Constant(0.0), state_shape,
-                                       name="h_state")
-        c_param = L.utils.create_param(L.init.Constant(0.0), state_shape,
-                                       name="c_state")
-
-        hid = L.layers.InputLayer((batch_sz, n_hid_unit), input_var=h_param)
-        cell = L.layers.InputLayer((batch_sz, n_hid_unit), input_var=c_param)
-
-        if unroll:
-            sys.setrecursionlimit(int(2000 + batch_sz * seq_len))
-        raw_lay = self.LSTMLayer(l_prev, n_hid_unit,
-                                 hid_init=hid, cell_init=cell,
+    @args_from_opt(2)
+    def _make_recurrent_layer(self, l_prev, state_layers, n_hid_unit,
+                              grad_clip=100, unroll=False):
+        hid_lay = state_layers[0]
+        raw_lay = self.GRULayer(l_prev, n_hid_unit,
+                                 hid_init=hid_lay,
                                  grad_clipping=grad_clip,
                                  nonlinearity=L.nonlinearities.tanh,
-                                 name='LSTM_raw',
+                                 name='GRU_raw',
                                  unroll_scan=unroll)
-        return_lay = self.ExtractLSTMOut(raw_lay, name='LSTM_return')
-        state_lay = self.ExtractLastStates(raw_lay, name='LSTM_states')
+        return raw_lay
 
-        cell_upd, hid_upd = L.layers.get_output(state_lay)
-        self.hidden_state_updates[hid] = (h_param, hid_upd)
-        self.hidden_state_updates[cell] = (c_param, cell_upd)
-        return return_lay
+    class GRULayer(L.layers.GRULayer):
+        """
+        Copy of standard lasagne.layers.LSTMLayer
+        with overwritten get_output_for such that it returns cell state
+        """
 
-    def compiled_function(self, *args, **kwargs):
-        updates = kwargs.pop('updates', list())
-        if isinstance(updates, dict):
-            updates.update(self.hidden_state_updates.values())
-        elif isinstance(updates, tuple):
-            updates = chain(updates, self.hidden_state_updates.values())
-        else:
-            updates.extend(self.hidden_state_updates.values())
+        def get_output_for(self, inputs, **kwargs):
+            """
+            Compute this layer's output function given a symbolic input variable
 
-        return super().compiled_function(*args, updates=updates, **kwargs)
+            Parameters
+            ----------
+            inputs : list of theano.TensorType
+                `inputs[0]` should always be the symbolic input variable.  When
+                this layer has a mask input (i.e. was instantiated with
+                `mask_input != None`, indicating that the lengths of sequences in
+                each batch vary), `inputs` should have length 2, where `inputs[1]`
+                is the `mask`.  The `mask` should be supplied as a Theano variable
+                denoting whether each time step in each sequence in the batch is
+                part of the sequence or not.  `mask` should be a matrix of shape
+                ``(n_batch, n_time_steps)`` where ``mask[i, j] = 1`` when ``j <=
+                (length of sequence i)`` and ``mask[i, j] = 0`` when ``j > (length
+                of sequence i)``. When the hidden state of this layer is to be
+                pre-filled (i.e. was set to a :class:`Layer` instance) `inputs`
+                should have length at least 2, and `inputs[-1]` is the hidden state
+                to prefill with.
+
+            Returns
+            -------
+            layer_output : theano.TensorType
+                Symbolic output variable.
+            """
+            unroll_scan = L.utils.unroll_scan
+            Layer = L.layers.Layer
+
+            # Retrieve the layer input
+            input = inputs[0]
+            # Retrieve the mask when it is supplied
+            mask = None
+            hid_init = None
+            if self.mask_incoming_index > 0:
+                mask = inputs[self.mask_incoming_index]
+            if self.hid_init_incoming_index > 0:
+                hid_init = inputs[self.hid_init_incoming_index]
+
+            # Treat all dimensions after the second as flattened feature dimensions
+            if input.ndim > 3:
+                input = T.flatten(input, 3)
+
+            # Because scan iterates over the first dimension we dimshuffle to
+            # (n_time_steps, n_batch, n_features)
+            input = input.dimshuffle(1, 0, 2)
+            seq_len, num_batch, _ = input.shape
+
+            # Stack input weight matrices into a (num_inputs, 3*num_units)
+            # matrix, which speeds up computation
+            W_in_stacked = T.concatenate(
+                [self.W_in_to_resetgate, self.W_in_to_updategate,
+                 self.W_in_to_hidden_update], axis=1)
+
+            # Same for hidden weight matrices
+            W_hid_stacked = T.concatenate(
+                [self.W_hid_to_resetgate, self.W_hid_to_updategate,
+                 self.W_hid_to_hidden_update], axis=1)
+
+            # Stack gate biases into a (3*num_units) vector
+            b_stacked = T.concatenate(
+                [self.b_resetgate, self.b_updategate,
+                 self.b_hidden_update], axis=0)
+
+            if self.precompute_input:
+                # precompute_input inputs*W. W_in is (n_features, 3*num_units).
+                # input is then (n_batch, n_time_steps, 3*num_units).
+                input = T.dot(input, W_in_stacked) + b_stacked
+
+            # At each call to scan, input_n will be (n_time_steps, 3*num_units).
+            # We define a slicing function that extract the input to each GRU gate
+            def slice_w(x, n):
+                return x[:, n*self.num_units:(n+1)*self.num_units]
+
+            # Create single recurrent computation step function
+            # input__n is the n'th vector of the input
+            def step(input_n, hid_previous, *args):
+                # Compute W_{hr} h_{t - 1}, W_{hu} h_{t - 1}, and W_{hc} h_{t - 1}
+                hid_input = T.dot(hid_previous, W_hid_stacked)
+
+                if self.grad_clipping:
+                    input_n = theano.gradient.grad_clip(
+                        input_n, -self.grad_clipping, self.grad_clipping)
+                    hid_input = theano.gradient.grad_clip(
+                        hid_input, -self.grad_clipping, self.grad_clipping)
+
+                if not self.precompute_input:
+                    # Compute W_{xr}x_t + b_r, W_{xu}x_t + b_u, and W_{xc}x_t + b_c
+                    input_n = T.dot(input_n, W_in_stacked) + b_stacked
+
+                # Reset and update gates
+                resetgate = slice_w(hid_input, 0) + slice_w(input_n, 0)
+                updategate = slice_w(hid_input, 1) + slice_w(input_n, 1)
+                resetgate = self.nonlinearity_resetgate(resetgate)
+                updategate = self.nonlinearity_updategate(updategate)
+
+                # Compute W_{xc}x_t + r_t \odot (W_{hc} h_{t - 1})
+                hidden_update_in = slice_w(input_n, 2)
+                hidden_update_hid = slice_w(hid_input, 2)
+                hidden_update = hidden_update_in + resetgate*hidden_update_hid
+                if self.grad_clipping:
+                    hidden_update = theano.gradient.grad_clip(
+                        hidden_update, -self.grad_clipping, self.grad_clipping)
+                hidden_update = self.nonlinearity_hid(hidden_update)
+
+                # Compute (1 - u_t)h_{t - 1} + u_t c_t
+                hid = (1 - updategate)*hid_previous + updategate*hidden_update
+                return hid
+
+            def step_masked(input_n, mask_n, hid_previous, *args):
+                hid = step(input_n, hid_previous, *args)
+
+                # Skip over any input with mask 0 by copying the previous
+                # hidden state; proceed normally for any input with mask 1.
+                hid = T.switch(mask_n, hid, hid_previous)
+
+                return hid
+
+            if mask is not None:
+                # mask is given as (batch_size, seq_len). Because scan iterates
+                # over first dimension, we dimshuffle to (seq_len, batch_size) and
+                # add a broadcastable dimension
+                mask = mask.dimshuffle(1, 0, 'x')
+                sequences = [input, mask]
+                step_fun = step_masked
+            else:
+                sequences = [input]
+                step_fun = step
+
+            if not isinstance(self.hid_init, Layer):
+                # Dot against a 1s vector to repeat to shape (num_batch, num_units)
+                hid_init = T.dot(T.ones((num_batch, 1)), self.hid_init)
+
+            # The hidden-to-hidden weight matrix is always used in step
+            non_seqs = [W_hid_stacked]
+            # When we aren't precomputing the input outside of scan, we need to
+            # provide the input weights and biases to the step function
+            if not self.precompute_input:
+                non_seqs += [W_in_stacked, b_stacked]
+
+            if self.unroll_scan:
+                # Retrieve the dimensionality of the incoming layer
+                input_shape = self.input_shapes[0]
+                # Explicitly unroll the recurrence instead of using scan
+                hid_out = unroll_scan(
+                    fn=step_fun,
+                    sequences=sequences,
+                    outputs_info=[hid_init],
+                    go_backwards=self.backwards,
+                    non_sequences=non_seqs,
+                    n_steps=input_shape[1])[0]
+            else:
+                # Scan op iterates over first dimension of input and repeatedly
+                # applies the step function
+                hid_out = theano.scan(
+                    fn=step_fun,
+                    sequences=sequences,
+                    go_backwards=self.backwards,
+                    outputs_info=[hid_init],
+                    non_sequences=non_seqs,
+                    truncate_gradient=self.gradient_steps,
+                    strict=True)[0]
+
+            return hid_out
 
 
 class LearningRateMixin(MixinBase):

@@ -7,6 +7,7 @@ import tempfile
 import warnings
 from asyncio.subprocess import PIPE
 from collections import (namedtuple, OrderedDict, defaultdict, deque)
+from contextlib import contextmanager
 from functools import partial
 from typing import List, Union
 import re
@@ -52,13 +53,13 @@ class BaseCook(ClassSaveLoadMixin):
 
     def close_all_shops(self):
         for klass in self.__class__.__mro__:
-            if hasattr(klass, 'close_shop'):
-                klass.open_shop(self)
+            if 'close_shop' in klass.__dict__:
+                klass.__dict__['close_shop'](self)
 
     def open_all_shops(self):
         for klass in self.__class__.__mro__:
-            if hasattr(klass, 'open_shop'):
-                klass.open_shop(self)
+            if 'open_shop' in klass.__dict__:
+                klass.__dict__['open_shop'](self)
 
     def open_shop(self):
         """
@@ -76,10 +77,6 @@ class BaseCook(ClassSaveLoadMixin):
         """
         self.fridge.shelves['recipe'][
             'all_params'] = self.recipe.get_all_params_copy()
-
-    def to_dict(self):
-        self.close_shop()
-        return super().to_dict()
 
 
 class LasagneTrainer(BaseCook):
@@ -118,22 +115,36 @@ class LasagneTrainer(BaseCook):
         pb, msg = pbar('batches', s_ep * (bpe_train + bpe_val), message(-1, -1))
         pb.start()
 
+
         train_err_hist = list(move_pbar(pb, self.train(1)))
         val_err_hist = list(move_pbar(pb, self.val(1)))
 
         l1 = len(train_err_hist)
         l2 = len(val_err_hist)
+
+
+
         te_err = np.mean(val_err_hist[-l2:])
         tr_err = np.mean(train_err_hist[-l1:])
+        max_err = tr_err
         msg.message = message(te_err, tr_err)
 
-        for j in range(self.opt.start_epochs - 1):
-            train_err_hist.extend(move_pbar(pb, self.train(1)))
-            val_err_hist.extend(move_pbar(pb, self.val(1)))
+        @contextmanager
+        def reset_if_nan(m):
+            params = self.recipe.get_all_params_copy()
+            yield
+            if np.isnan(train_err_hist[-1]):
+                self.recipe.set_all_params(params)
+                m.message = 'nan results, retrying...'
 
-            te_err = np.mean(val_err_hist[-l2:])
-            tr_err = np.mean(train_err_hist[-l1:])
-            msg.message = message(te_err, tr_err)
+        for j in range(self.opt.start_epochs - 1):
+            with reset_if_nan(msg):
+                train_err_hist.extend(move_pbar(pb, self.train(1)))
+                val_err_hist.extend(move_pbar(pb, self.val(1)))
+
+                te_err = np.mean(val_err_hist[-l2:])
+                tr_err = np.mean(train_err_hist[-l1:])
+                msg.message = message(te_err, tr_err)
         pb.finish()
 
         perf_tol = self.opt.get('perf_tol', 0.0)
@@ -141,18 +152,20 @@ class LasagneTrainer(BaseCook):
         grace_epochs = self.opt.get('grace_epochs', s_ep + MEM) - s_ep
 
         params = deque([self.recipe.get_all_params_copy()])
-        val_err = deque([np.mean(val_err_hist)])
+        te_err = te_err if not np.isnan(te_err) else max_err * 10
+        val_err = deque([te_err])
 
         pb, msg = pbar('epochs', self.opt.decay_epochs, message(te_err, tr_err))
         for _i in pb(range(self.opt.decay_epochs)):
             i = _i + 1
             try:
-                train_err_hist.extend(self.train(1))
-                val_err_hist.extend(self.val(1))
-                te_err = np.mean(val_err_hist[-l2:])
-                tr_err = np.mean(train_err_hist[-l1:])
-                msg.message = message(te_err, tr_err)
-
+                with reset_if_nan(msg):
+                    train_err_hist.extend(self.train(1))
+                    val_err_hist.extend(self.val(1))
+                    te_err = np.mean(val_err_hist[-l2:])
+                    tr_err = np.mean(train_err_hist[-l1:])
+                    msg.message = message(te_err, tr_err)
+                    te_err = te_err if not np.isnan(te_err) else max_err * 10
             except KeyboardInterrupt:
                 break
 
@@ -221,12 +234,10 @@ class CharmapMixin(CookMixinBase):
     def oven(self) -> oven.CharmappedGeneratorMixin: return None
 
     def open_shop(self):
-        super().open_shop()
         if 'charmap' in self.fridge.shelves['oven']:
             self.oven.charmap = self.fridge.shelves['oven'].charmap
 
     def close_shop(self):
-        super().close_shop()
         self.fridge.shelves['oven']['charmap'] = self.oven.charmap
 
 @mixin_mock
@@ -242,11 +253,11 @@ class LearningRateMixin(CookMixinBase):
         yield from super().train(epochs)
         self.epochs_trained += epochs
 
-
+@mixin_mock
 class ResetStateMixin(CookMixinBase):
     @mixin_mock
     @property
-    def recipe(self) -> Union[LasagneBase, LCrecipe.LSTMStateReuse]: return None
+    def recipe(self) -> Union[LasagneBase, LCrecipe.StateReuseMixin]: return None
 
     def train(self, *args, **kwargs) -> List[None]:
         self.recipe.reset_hidden_states()
@@ -291,22 +302,38 @@ class AsyncHeadChef(LasagneTrainer):
             for iter_res in self.make_feature_net(**features):
                 yield res + iter_res
 
-    def featurenet_train(self, out_dir, session_id, concurrent=3, **features):
+    def featurenet_train(self, out_dir, session_id, concurrent,
+                         *feature_packs, **feature_permutations):
         try:
             os.mkdir(out_dir)
         except IOError:
             pass
 
-        self.fridge.save(out_dir + os.sep + 'basemodel.lfr')
+        self.basemodel_path = out_dir + os.sep + 'basemodel.lfr'
+        self.fridge.save(self.basemodel_path,
+                         manifest=('lasagnecaterer',))
+
+        """
         fd_bm, self.basemodel_path = tempfile.mkstemp(suffix='.lrf',
                                                       prefix='basemodel',
                                                       dir=os.path.abspath('.'))
         with open(fd_bm, 'wb') as fp:
             self.fridge.save(fp)
         atexit.register(partial(os.remove, self.basemodel_path))
-
+        """
         self.semaphore = BatchSemaphore(concurrent)
-        override_combinations = list(self.make_feature_net(**dict(features)))
+        override_permutations = list(self.make_feature_net(**dict(feature_permutations)))
+        if not feature_packs:
+            override_combinations = override_permutations
+        elif not override_permutations:
+            override_combinations = feature_packs
+        else:
+            override_combinations = list()
+            for pack in feature_packs:
+                override_combinations.extend(perm + list(pack)
+                                             for perm in override_permutations)
+
+        override_combinations.sort()
         to_do = [self.train_model(overrides, out_dir) for overrides
                  in override_combinations]
 
@@ -446,13 +473,13 @@ class AsyncHeadChef(LasagneTrainer):
                 lines = [b'print("setting opts")']
                 # send commands to worker to change features
                 for feature_name, value in overrides:
-                    lines.append('obj.opt.{0} = {1}'.format(feature_name,
+                    lines.append('fr.opt.{0} = {1}'.format(feature_name,
                                                             value).encode())
-                lines.append(b'sys.stdout.write(str(obj.opt))')
-                lines.append(b'del obj.recipe.saved_params')
+                lines.append(b'sys.stdout.write(str(fr.opt))')
+                lines.append(b'del fr.recipe.saved_params')
                 # startup the training
-                lines.append(b'obj.cook.auto_train()')
-                lines.append('obj.save("{0}")'.format(fname).encode())
+                lines.append(b'fr.cook.auto_train()')
+                lines.append('fr.save("{0}")'.format(fname).encode())
 
 
                 # wrap lines to one statement and feed to process
@@ -500,14 +527,6 @@ class AsyncHeadChef(LasagneTrainer):
 
     def __del__(self):
         self.terminate()
-
-
-class AsyncHCLearningRate(LearningRateMixin, AsyncHeadChef):
-    pass
-
-class AsyncHCLearningRateStateReuse(ResetStateMixin, LearningRateMixin, AsyncHeadChef):
-    pass
-
 
 """
 import asyncio

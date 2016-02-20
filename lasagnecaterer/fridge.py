@@ -132,7 +132,6 @@ class SynthesizerMixin(ClassSaveLoadMixin):
         if len([b for b in bases if issubclass(b, SynthesizerMixin)]) > 1:
             raise NotImplementedError('Synthesizing already synthesized bases'
                                       'is currently not supported.\nbases: ' + str(bases))
-
         return {'base_descriptions': [self.dscr_from_class(klass)._asdict()
                                       for klass in bases],
                 'metaclass_description': self.dscr_from_class(type(self.__class__))._asdict(),
@@ -425,7 +424,6 @@ class SaveLoadZipFilemixin(ClassDescriptionMixin, SaveLoadBase):
                 stack.extend(os.scandir(file.path))
 
     def save(self, file, manifest=tuple(), **kwargs):
-        print(manifest)
         data = self.to_dict()
         assert isinstance(data, OrderedDict)
         if isinstance(file, str):
@@ -536,6 +534,7 @@ class BaseFridge(SaveLoadZipFilemixin, ClassDescriptionMixin):
         self.cook = cook_cls(opt, self.oven, self.recipe, self)
 
     def to_dict(self) -> OrderedDict:
+        self.cook.close_all_shops()
         data = OrderedDict([('fridge', self.class_descr()),
                             ('opt', self.opt),
                             ('oven_cls', self.oven),
