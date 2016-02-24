@@ -295,8 +295,8 @@ class AsyncHeadChef(LasagneTrainer):
         self.active_procs = list()
 
     def revive(self):
-        self.progress_mon.terminated = False
         self.terminated = False
+        self.progress_mon.revive()
 
     def make_feature_net(self, **features):
         feature_name = sorted(features.keys())  # sort alphabetically

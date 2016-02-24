@@ -38,7 +38,7 @@ from bokeh.models import ColumnDataSource, Range1d, FactorRange, HoverTool, \
     TextEditor
 from bokeh.plotting import figure, hplot, vplot, gridplot
 from bokeh.client import push_session
-from bokeh.io import curdoc
+from bokeh.io import curdoc, curstate
 from bokeh.palettes import RdYlGn5, RdYlGn7
 from bokeh.models.widgets.tables import DataTable
 
@@ -649,6 +649,10 @@ class ChangeStream(asyncio.Queue):
                 if change.command == 'terminate':
                     self._terminating = False
                     self.terminated = True
+                    while not self.empty():
+                        self.get_nowait()
+                    self._unfinished_tasks = 0
+                    self.sentinel2subscribers.clear()
                     return
 
     async def terminate(self):
@@ -775,7 +779,8 @@ class RessourceMonitor:
 
         while self.monitors:
             await self.change_stream.wait_for_change(chain(*self.monitors.values()))
-        self.terminated = True
+        self._terminating, self.terminated = False, True
+
 
     @contextmanager
     def register_mon(self, *sentinels):
@@ -1280,7 +1285,6 @@ class BokehPlots:
         def waiter(sentinel, console: BokehConsole):
             change = yield sentinel
             if hasattr(sentinel, 'bytes'):
-                while not self.terminated:
                     console.output_text(change.bytes.decode())
                     change = yield
             else:
@@ -1351,6 +1355,7 @@ class BokehPlots:
 
     def serve(self, host='localhost', port=5006, session_id='test'):
         url = 'http://' + host + ':' + str(port) + '/'
+        curstate().reset()
         self.session = push_session(curdoc(),
                                     session_id=session_id,
                                     url=url)
@@ -1522,6 +1527,8 @@ class ProgressMonitor:
         await self.change_q.terminate()
         self.terminated = True
         self._terminating = False
+        self.plot_gen.terminated = True
+        self.plot_gen = None
 
     async def start(self, session_id, job_names):
         if self.terminated:
@@ -1538,6 +1545,9 @@ class ProgressMonitor:
         self.terminated = False
         self.change_q.terminated = False
         self.ressource_mon.terminated = False
+        if self.plot_gen is None:
+            self.plot_gen = BokehPlots(self.change_q)
+
 
 class BatchSemaphore(asyncio.locks.Semaphore):
     def __init__(self, n_locks, loop=None):
