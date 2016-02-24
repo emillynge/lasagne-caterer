@@ -129,13 +129,19 @@ class LasagneTrainer(BaseCook):
         max_err = tr_err
         msg.message = message(te_err, tr_err)
 
+        prev_p, p = (None, None)
         @contextmanager
         def reset_if_nan(m):
-            params = self.recipe.get_all_params_copy()
+            nonlocal p, prev_p
+            prev_p, p = p, self.recipe.get_all_params_copy()
             yield
             if np.isnan(train_err_hist[-1]):
-                self.recipe.set_all_params(params)
-                m.message = 'nan results, retrying...'
+                p, prev_p = prev_p, None
+                if p:
+                    self.recipe.set_all_params(p)
+                    m.message = 'nan results, retrying...'
+                else:
+                    raise AttributeError('Recived non-recoverable NaN results')
 
         for j in range(self.opt.start_epochs - 1):
             with reset_if_nan(msg):
@@ -288,8 +294,14 @@ class AsyncHeadChef(LasagneTrainer):
         self.progress_mon = ProgressMonitor('test')
         self.active_procs = list()
 
+    def revive(self):
+        self.progress_mon.terminated = False
+        self.terminated = False
+
     def make_feature_net(self, **features):
         feature_name = sorted(features.keys())  # sort alphabetically
+        if not features:
+            return list()
         feature_name = sorted(feature_name,  # sort number of possible values
                               key=lambda k: len(features[k]))[0]
         feature_list = features.pop(feature_name)
@@ -308,7 +320,7 @@ class AsyncHeadChef(LasagneTrainer):
             os.mkdir(out_dir)
         except IOError:
             pass
-
+        self.revive()
         self.basemodel_path = out_dir + os.sep + 'basemodel.lfr'
         self.fridge.save(self.basemodel_path,
                          manifest=('lasagnecaterer',))
@@ -326,7 +338,7 @@ class AsyncHeadChef(LasagneTrainer):
         if not feature_packs:
             override_combinations = override_permutations
         elif not override_permutations:
-            override_combinations = feature_packs
+            override_combinations = list(feature_packs)
         else:
             override_combinations = list()
             for pack in feature_packs:
@@ -340,18 +352,17 @@ class AsyncHeadChef(LasagneTrainer):
         job_names = [self.prefix_from_overrides(o) for o in
                      override_combinations]
 
-        try:
+        #try:
+        if True:
             with self.progress_mon.change_q.redirect_stdout(copy=True):
                 with self.progress_mon.change_q.redirect_stderr(copy=True):
                     coros = asyncio.gather(self.progress_mon.start(session_id,
                                                                    job_names),
                                            self.trainer_coro(to_do))
                     self.loop.run_until_complete(coros)
-                    self.loop.close()
-        finally:
-            self.terminate()
-
-    def terminate(self):
+        #finally:
+        #    self.loop.run_until_complete(self.terminate())
+    async def terminate(self):
         while self.active_procs:
             proc = self.active_procs.pop()
             assert isinstance(proc, asyncio.subprocess.Process)
@@ -362,7 +373,7 @@ class AsyncHeadChef(LasagneTrainer):
                 pass
 
         if not self.progress_mon.terminated:
-            self.progress_mon.terminate()
+            await self.progress_mon.terminate()
 
     async def trainer_coro(self, to_do):
         n = len(to_do)
@@ -372,7 +383,8 @@ class AsyncHeadChef(LasagneTrainer):
         for future in to_do_iter:
             await future
             i += 1
-        self.progress_mon.terminate()
+        await self.progress_mon.terminate()
+        print('Done')
 
     async def write_to_log(self, stream: asyncio.streams.StreamReader,
                            logfile: ioabc.OutputStream,
@@ -402,7 +414,7 @@ class AsyncHeadChef(LasagneTrainer):
     @staticmethod
     def prefix_from_overrides(overrides):
         return '_'.join(
-            '{0}-{1:02.0f}'.format(key, val * 100 if val <= 1 and isinstance(val,
+            '{0}-{1:03.0f}'.format(key, val * 1000 if val <= 1 and isinstance(val,
                                                                             float) else val)
             for key, val in overrides)
 
@@ -465,18 +477,18 @@ class AsyncHeadChef(LasagneTrainer):
                 assert isinstance(stdin, asyncio.streams.StreamWriter)
 
                 def wrap(lines) -> bytes:
-                    cmd = b'import sys;return_code = 1;'
+                    cmd = b'import sys;import os;return_code = 1;'
                     cmd += b';'.join(lines)
                     cmd += b';return_code = 0\n'
                     return cmd
 
-                lines = [b'print("setting opts")']
+                lines = [b'print("setting opts")', b'print("PID: {}".format(os.getpid()))']
                 # send commands to worker to change features
                 for feature_name, value in overrides:
                     lines.append('fr.opt.{0} = {1}'.format(feature_name,
                                                             value).encode())
                 lines.append(b'sys.stdout.write(str(fr.opt))')
-                lines.append(b'del fr.recipe.saved_params')
+                lines.append(b'fr.recipe.reset_params()')
                 # startup the training
                 lines.append(b'fr.cook.auto_train()')
                 lines.append('fr.save("{0}")'.format(fname).encode())

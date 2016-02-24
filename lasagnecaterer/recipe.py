@@ -37,7 +37,7 @@ class ScalarParameter:
         opt = instance.opt
         callback = partial(self.opt_callback, instance)
         init_val = set_val if set_val is not None else opt.get(self.opt_name,
-                                                            self.default)
+                                                               self.default)
         if not self.shape:
             param = theano.shared(self.spec_type(init_val).sample((1,))[0])
         else:
@@ -52,7 +52,7 @@ class ScalarParameter:
             self.instances[instance] = self.make_param(instance)
         return self.instances[instance][0]
 
-    def __set__(self, instance, value):
+    def __set__(self, instance, value) -> theano.Variable:
         if instance not in self.instances:
             self.instances[instance] = self.make_param(instance)
         self.instances[instance][0].set_value(value)
@@ -71,7 +71,7 @@ class OneHotLayer(L.layers.Layer):
 class LasagneBase(ChainedProps, ClassSaveLoadMixin,
                   metaclass=ChainPropsABCMetaclass):
     def __init__(self, *args, **kwargs):
-        super(LasagneBase, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         self.saved_params = None
 
     @property
@@ -187,15 +187,20 @@ class LasagneBase(ChainedProps, ClassSaveLoadMixin,
         return self.cost_metric(flattened_output)
 
     def compiled_function(self, *args, givens=tuple(), **kwargs):
-        kwargs['givens'] = list(givens)# + [self.learning_rate]
+        kwargs['givens'] = list(givens)  # + [self.learning_rate]
         return theano.function(*args, **kwargs)
 
     learning_rate = ScalarParameter('learning_rate', default=.002)
-
+    decay_rate = ScalarParameter('decay_rate', default=.9)
+    final_grad_clip = ScalarParameter('final_grad_clip', default=5.0)
     @property
     def train_updates(self):
-        return L.updates.rmsprop(self.cost, self.all_train_params,
-                                 self.learning_rate)
+        grads = theano.grad(self.cost, self.all_train_params)
+        if self.final_grad_clip.get_value():
+            grads = [T.clip(g, -self.final_grad_clip, self.final_grad_clip) for g in grads]
+
+        return L.updates.rmsprop(grads, self.all_train_params,
+                                 self.learning_rate, rho=self.decay_rate)
 
     @property
     def f_train(self):
@@ -318,7 +323,8 @@ class LasagneBase(ChainedProps, ClassSaveLoadMixin,
         """
         raise NotImplementedError
 
-    def predict_transform(self, l_top: L.layers.Layer, l_out_flat: L.layers.Layer) -> L.layers.Layer:
+    def predict_transform(self, l_top: L.layers.Layer,
+                          l_out_flat: L.layers.Layer) -> L.layers.Layer:
         raise NotImplementedError
 
     def cost_metric(self, flattened_output, features):
@@ -329,8 +335,16 @@ class LasagneBase(ChainedProps, ClassSaveLoadMixin,
         """
         raise NotImplementedError
 
+class RecurrentLayers(LasagneBase):
+    @property
+    def l_top(self, n_hid_unit, n_hid_lay):
+        """
+        fit LSTM layers in between bottom and top
+        get args to make sure we invalidate cache on change
+        :return:
+        """
+        return self.build_recurrent_layers(self.l_bottom)
 
-class LSTMBase(LasagneBase):
     @args_from_opt(1)
     def build_recurrent_layers(self, l_prev, n_hid_lay):
         """
@@ -340,15 +354,11 @@ class LSTMBase(LasagneBase):
         :return:
         """
         for i in range(n_hid_lay):
-            print('LSTM-in', i, l_prev.output_shape)
             l_prev = self.make_recurrent_layer(l_prev)
         return l_prev
 
-    @args_from_opt(1)
-    def make_recurrent_layer(self, l_prev, n_hid_unit, grad_clip=5):
-        return L.layers.LSTMLayer(l_prev, n_hid_unit,
-                                  grad_clipping=grad_clip,
-                                  nonlinearity=L.nonlinearities.tanh)
+    def make_recurrent_layer(self, l_prev, *args, **kwargs):
+        raise NotImplementedError
 
     @args_from_opt(1)
     def out_transform(self, l_prev, n_hid_unit, features):
@@ -363,13 +373,6 @@ class LSTMBase(LasagneBase):
         return L.layers.DenseLayer(l_shp, num_units=features,
                                    nonlinearity=L.nonlinearities.softmax)
 
-    @property
-    def l_top(self, n_hid_unit, n_hid_lay):
-        """
-        fit LSTM layers in between bottom and top
-        :return:
-        """
-        return self.build_recurrent_layers(self.l_bottom)
 
     @args_from_opt(1)
     def init_params(self, saved_params, W_range=0.08):
@@ -397,19 +400,21 @@ class LSTMBase(LasagneBase):
         :param features:
         :return:
         """
-        normed_output = flattened_output * (1 - 2 * self.cost_stability) + self.cost_stability
+        normed_output = flattened_output * (
+        1 - 2 * self.cost_stability) + self.cost_stability
 
         return T.nnet.categorical_crossentropy(normed_output,
                                                self.target_values.reshape(
                                                    (-1, features))).mean()
 
     def compiled_function(self, *args, givens=tuple(), **kwargs):
-        kwargs['givens'] = list(givens)# + [self.cost_stability]
-        return super(LSTMBase, self).compiled_function(*args, **kwargs)
+        kwargs['givens'] = list(givens)  # + [self.cost_stability]
+        return super().compiled_function(*args, **kwargs)
 
     @args_from_opt(2)
     def predict_transform(self, l_top: L.layers.Layer,
-                          l_out_flat: L.layers.DenseLayer, n_hid_unit) -> L.layers.Layer:
+                          l_out_flat: L.layers.DenseLayer,
+                          n_hid_unit) -> L.layers.Layer:
         return OneHotLayer(l_out_flat, axis=1, name='onehot_pred')
 
 
@@ -439,8 +444,8 @@ class GRUBase(LasagneBase):
     @args_from_opt(1)
     def make_recurrent_layer(self, l_prev, n_hid_unit, grad_clip=5):
         return L.layers.GRULayer(l_prev, n_hid_unit,
-                                  grad_clipping=grad_clip,
-                                  nonlinearity=L.nonlinearities.tanh)
+                                 grad_clipping=grad_clip,
+                                 nonlinearity=L.nonlinearities.tanh)
 
     @args_from_opt(1)
     def out_transform(self, l_prev, n_hid_unit, features):
@@ -493,9 +498,24 @@ class GRUBase(LasagneBase):
 
     @args_from_opt(2)
     def predict_transform(self, l_top: L.layers.Layer,
-                          l_out_flat: L.layers.DenseLayer, n_hid_unit) -> L.layers.Layer:
+                          l_out_flat: L.layers.DenseLayer,
+                          n_hid_unit) -> L.layers.Layer:
         return OneHotLayer(l_out_flat, axis=1, name='onehot_pred')
 
+
+class LSTMBase(RecurrentLayers):
+    @args_from_opt(1)
+    def make_recurrent_layer(self, l_prev, n_hid_unit, grad_clip=5):
+        return L.layers.LSTMLayer(l_prev, n_hid_unit,
+                                  grad_clipping=grad_clip,
+                                  nonlinearity=L.nonlinearities.tanh)
+
+
+class GRUBase(RecurrentLayers):
+    @args_from_opt(1)
+    def make_recurrent_layer(self, l_prev, n_hid_unit, grad_clip=5):
+        return L.layers.GRULayer(l_prev, n_hid_unit,
+                                 grad_clipping=grad_clip)
 
 class MixinBase(metaclass=ChainPropsABCMetaclass): pass
 
@@ -533,6 +553,22 @@ class RandomPredictMixin(MixinBase):
         return self.RandomOnehotLayer(l_out, sigma=self.pred_sigma,
                                       name='pred_trans')
 
+class CostStabilityMixin(MixinBase):
+    cost_stability = ScalarParameter('cost_stability', default=1e-6)
+    @args_from_opt(1)
+    def cost_metric(self, flattened_output, features):
+        """
+        Cross entropy cost metric
+        :param flattened_output:
+        :param features:
+        :return:
+        """
+        normed_output = flattened_output * (
+        1 - 2 * self.cost_stability) + self.cost_stability
+
+        return T.nnet.categorical_crossentropy(normed_output,
+                                               self.target_values.reshape(
+                                                   (-1, features))).mean()
 
 class DebugMixin(MixinBase):
     rho = ScalarParameter('rho', default=0.9)
@@ -544,7 +580,8 @@ class DebugMixin(MixinBase):
         learning_rate = self.learning_rate
         rho = self.rho
         epsilon = self.epsilon
-        init_params = OrderedDict(rho=rho, epsilon=epsilon, leaning_rate=learning_rate,
+        init_params = OrderedDict(rho=rho, epsilon=epsilon,
+                                  leaning_rate=learning_rate,
                                   loss=loss)
         debug_info['init_params'] = init_params
         for param, grad in zip(params, grads):
@@ -560,10 +597,13 @@ class DebugMixin(MixinBase):
             calculations['accu_new'] = rho * accu + (1 - rho) * grad ** 2
             calculations['param'] = param
             calculations['grad'] = grad
-            calculations['accu_new + epsilon'] = calculations['accu_new'] + epsilon
-            calculations['T.sqrt(accu_new + epsilon)'] = T.sqrt(calculations['accu_new'] + epsilon)
+            calculations['accu_new + epsilon'] = calculations[
+                                                     'accu_new'] + epsilon
+            calculations['T.sqrt(accu_new + epsilon)'] = T.sqrt(
+                calculations['accu_new'] + epsilon)
             calculations['new_param'] = param - (learning_rate * grad /
-                                      T.sqrt(calculations['accu_new'] + epsilon))
+                                                 T.sqrt(calculations[
+                                                            'accu_new'] + epsilon))
             debug_info[param] = calculations
 
         return debug_info
@@ -575,20 +615,19 @@ class DebugMixin(MixinBase):
                                       allow_input_downcast=True,
                                       )
 
-
     def unpack_debug_info(self, debug_info, computed=tuple()):
         computed = list(computed)
         computed.reverse()
         for key, value in debug_info.items():
             if computed:
                 name = key.name if hasattr(key, 'name') else str(key)
-                print('#' * 10 + name + '#'*10)
+                print('#' * 10 + name + '#' * 10)
             for kkey, vvalue in value.items():
                 if computed:
                     nname = kkey.name if hasattr(kkey, 'name') else str(kkey)
-                    print('-'*10 + nname + '-'*10)
+                    print('-' * 10 + nname + '-' * 10)
                     print(computed.pop())
-                    print('-'*20)
+                    print('-' * 20)
                 else:
                     yield vvalue
 
@@ -607,7 +646,6 @@ class DebugMixin(MixinBase):
                 print('Outputs: %s' % [output[0] for output in fn.outputs])
                 raise ZeroDivisionError
 
-
     @property
     def f_train_debug(self):
         values = list(self.unpack_debug_info(self.debug_info))
@@ -616,21 +654,50 @@ class DebugMixin(MixinBase):
                                       updates=self.train_updates,
                                       allow_input_downcast=True,
                                       )
+
     @property
     def f_train_detect_nan(self):
         from theano.compile.nanguardmode import NanGuardMode
         return self.compiled_function([self.l_in.input_var, self.target_values],
-                                [self.cost_det], updates=self.train_updates,
-                               mode=NanGuardMode(True, True, True))
-
+                                      [self.cost_det],
+                                      updates=self.train_updates,
+                                      mode=NanGuardMode(True, True, True))
 
     @property
     def f_grad_detect_nan(self):
         grads = L.updates.get_or_compute_grads(self.cost, self.all_train_params)
         return self.compiled_function([self.l_in.input_var, self.target_values],
-                               grads + [self.cost_det, self.cost, L.layers.get_output(self.l_out)],
-                               mode=theano.compile.MonitorMode(
-                                      post_func=self.detect_nan))
+                                      grads + [self.cost_det, self.cost,
+                                               L.layers.get_output(self.l_out)],
+                                      mode=theano.compile.MonitorMode(
+                                          post_func=self.detect_nan))
+
+
+class LogsoftMixin(MixinBase):
+    @args_from_opt(1)
+    def cost_metric(self, flattened_output, features):
+        """
+        Cross entropy cost metric
+        :param flattened_output:
+        :param features:
+        :return:
+        """
+        return -T.sum(self.target_values.reshape((-1, features))
+                      * flattened_output, axis=flattened_output.ndim - 1).mean()
+
+    @args_from_opt(1)
+    def out_transform(self, l_prev, n_hid_unit, features):
+        """
+        Apply non-linear transform to l_prev
+        :param l_prev:
+        :param n_hid_unit:
+        :param features:
+        :return:
+        """
+        l_shp = L.layers.ReshapeLayer(l_prev, (-1, n_hid_unit))
+        return L.layers.DenseLayer(l_shp, num_units=features,
+                                   nonlinearity=T.nnet.logsoftmax)
+
 
 class SSEMixin(MixinBase):
     @args_from_opt(1)
@@ -750,11 +817,14 @@ class StateReuseMixin(MixinBase):
                              unroll=False):
         state_shape = (batch_sz, n_hid_unit)
         state_params = [L.utils.create_param(L.init.Constant(0.0), state_shape,
-                                       name=name + '_param') for name in self.state_names]
+                                             name=name + '_param') for name in
+                        self.state_names]
 
         state_in_layers = [L.layers.InputLayer((batch_sz, n_hid_unit),
-                                             input_var=param, name=name + '_lay')
-                         for param, name in zip(state_params, self.state_names)]
+                                               input_var=param,
+                                               name=name + '_lay')
+                           for param, name in
+                           zip(state_params, self.state_names)]
 
         if unroll:
             sys.setrecursionlimit(int(2000 + batch_sz * seq_len))
@@ -779,7 +849,8 @@ class StateReuseMixin(MixinBase):
         if isinstance(updates, dict):
             updates = updates.items()
 
-        kwargs['updates'] = list(updates) + list(self.hidden_state_updates.values())
+        kwargs['updates'] = list(updates) + list(
+            self.hidden_state_updates.values())
         return super().compiled_function(*args, **kwargs)
 
 
@@ -797,6 +868,7 @@ class LSTMStateReuseMixin(StateReuseMixin):
                                  grad_clipping=grad_clip,
                                  nonlinearity=L.nonlinearities.tanh,
                                  name='LSTM_raw',
+                                 forgetgate=L.layers.Gate(b=L.init.Constant(1.0)),
                                  unroll_scan=unroll)
         return raw_lay
 
@@ -1012,14 +1084,13 @@ class GRUStateReuseMixin(StateReuseMixin):
 
     @args_from_opt(2)
     def _make_recurrent_layer(self, l_prev, state_layers, n_hid_unit,
-                              grad_clip=100, unroll=False):
+                              grad_clip=5, unroll=False):
         hid_lay = state_layers[0]
         raw_lay = self.GRULayer(l_prev, n_hid_unit,
-                                 hid_init=hid_lay,
-                                 grad_clipping=grad_clip,
-                                 nonlinearity=L.nonlinearities.tanh,
-                                 name='GRU_raw',
-                                 unroll_scan=unroll)
+                                hid_init=hid_lay,
+                                grad_clipping=grad_clip,
+                                name='GRU_raw',
+                                unroll_scan=unroll)
         return raw_lay
 
     class GRULayer(L.layers.GRULayer):
@@ -1100,7 +1171,7 @@ class GRUStateReuseMixin(StateReuseMixin):
             # At each call to scan, input_n will be (n_time_steps, 3*num_units).
             # We define a slicing function that extract the input to each GRU gate
             def slice_w(x, n):
-                return x[:, n*self.num_units:(n+1)*self.num_units]
+                return x[:, n * self.num_units:(n + 1) * self.num_units]
 
             # Create single recurrent computation step function
             # input__n is the n'th vector of the input
@@ -1127,14 +1198,15 @@ class GRUStateReuseMixin(StateReuseMixin):
                 # Compute W_{xc}x_t + r_t \odot (W_{hc} h_{t - 1})
                 hidden_update_in = slice_w(input_n, 2)
                 hidden_update_hid = slice_w(hid_input, 2)
-                hidden_update = hidden_update_in + resetgate*hidden_update_hid
+                hidden_update = hidden_update_in + resetgate * hidden_update_hid
                 if self.grad_clipping:
                     hidden_update = theano.gradient.grad_clip(
                         hidden_update, -self.grad_clipping, self.grad_clipping)
                 hidden_update = self.nonlinearity_hid(hidden_update)
 
                 # Compute (1 - u_t)h_{t - 1} + u_t c_t
-                hid = (1 - updategate)*hid_previous + updategate*hidden_update
+                hid = (
+                      1 - updategate) * hid_previous + updategate * hidden_update
                 return hid
 
             def step_masked(input_n, mask_n, hid_previous, *args):
@@ -1191,13 +1263,13 @@ class GRUStateReuseMixin(StateReuseMixin):
                     truncate_gradient=self.gradient_steps,
                     strict=True)[0]
 
-            return hid_out
+            return (hid_out,)
 
 
 class LearningRateMixin(MixinBase):
     @args_from_opt(2)
     def set_learning_rate(self, alpha=None, step=None,
-                         start_alpha=(2 * 10 ** (-3)), alpha_factor=.95):
+                          start_alpha=(2 * 10 ** (-3)), alpha_factor=.95):
         if alpha is None:
             alpha = start_alpha * alpha_factor ** step
         self.learning_rate = alpha
