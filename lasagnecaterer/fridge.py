@@ -250,11 +250,13 @@ class SaveLoadZipFilemixin(ClassDescriptionMixin, SaveLoadBase):
             self._write_manifest(zf, manifest)
 
     @classmethod
-    def _load(cls, stream, handle_unknown=warnings.warn):
+    def _load(cls, stream, handle_unknown=warnings.warn, ignores=tuple()):
         data = OrderedDict()
         with ZipFile(stream, mode='r') as zf:
             for file_info in zf.filelist:
                 fname = file_info.filename
+                if fname in ignores:
+                    continue
                 if '/' in fname or any(fname.endswith(ign) for ign in
                                            cls.ignore_extentions):
                         continue
@@ -297,13 +299,13 @@ class SaveLoadZipFilemixin(ClassDescriptionMixin, SaveLoadBase):
                         klass, obj_name = cls.class_from_fname(fname, '.slzip.')
                         buffer = io.BytesIO(obj_stream.read())
                         buffer.seek(0)
-                        obj = klass.load(buffer)
+                        obj = klass.load(buffer, ignores=ignores)
 
                     elif fname.endswith('.lstzip'):
                         obj_name = fname[:-7]
                         buffer = io.BytesIO(obj_stream.read())
                         buffer.seek(0)
-                        obj = cls._load(buffer)
+                        obj = cls._load(buffer, ignores=ignores)
                         del buffer
                         obj = [obj[str(i)] for i in range(len(obj))]
 

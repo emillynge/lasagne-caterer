@@ -267,7 +267,10 @@ class _FloatArrayBuffer(io.BytesIO):
             return super().write(array_seq)
         n_arr = len(array_seq)
         if not self.array_len:
-            self.array_len = len(array_seq[0])
+            try:
+                self.array_len = len(array_seq[0])
+            except TypeError:
+                self.array_len = 1
 
         inp = chain(*array_seq) if isinstance(array_seq[0],
                                               Sequence) else array_seq
@@ -300,7 +303,11 @@ class FloatArrayBuffer(InputBuffer, _FloatArrayBuffer):
         def file2seq(file):
             import csv
             if file.name.endswith('.npy'):
-                return np.load(file).flatten().tolist()
+                npfile = np.load(file)
+                try:
+                    return npfile.flatten().tolist()
+                except AttributeError:
+                    return next(iter(npfile.items()))[1].flatten().tolist()
 
             if file.name.endswith('.csv'):
                 f = io.TextIOWrapper(file)

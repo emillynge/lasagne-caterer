@@ -33,7 +33,8 @@ except AssertionError:
     warnings.warn('Could not swap out tornado AIO-loop')
 
 import numpy as np
-from progressbar import (ProgressBar, Percentage, SimpleProgress, Bar, Widget)
+from progressbar import (ProgressBar, Percentage, SimpleProgress, Bar)
+from progressbar.widgets import WidgetBase as Widget
 from bokeh.models import ColumnDataSource, Range1d, FactorRange, HoverTool, \
     TextEditor
 from bokeh.plotting import figure, hplot, vplot, gridplot
@@ -310,12 +311,12 @@ class Message(Widget):
         return self.fmt.format(self.message[:self.max_width])
 
 
-def pbar(what, max_val, *args):
-    msg = Message(*args)
-    return ProgressBar(max_val, fd=sys.stdout,
-                       widgets=[SimpleProgress(), ' ',
-                                what, msg,
-                                Percentage(), Bar(), '\n']), msg
+def pbar(what, max_val, dyn_vars, *args):
+    from progressbar import DynamicMessage
+    widgets = [SimpleProgress(),
+               ' ', '{:10}'.format(what[:10])] + [DynamicMessage(name) for name in dyn_vars]
+
+    return ProgressBar(max_value=max_val, widgets=widgets)
 
 
 FNULL = open(os.devnull, 'w')

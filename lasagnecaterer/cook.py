@@ -104,7 +104,7 @@ class LasagneTrainer(BaseCook):
         s_ep = self.opt.start_epochs
         def move_pbar(_pb, it):
             for nex in it:
-                _pb.update(_pb.currval + 1)
+                _pb.update(_pb.value + 1)
                 yield nex
 
         print('Start train {} epochs\n'.format(s_ep))
@@ -112,7 +112,7 @@ class LasagneTrainer(BaseCook):
         bpe_val = self.oven.batches_per_epoch.val
 
         message = lambda te, tr: 'te: {0:1.3f} tr: {1:1.3f}'.format(te, tr)
-        pb, msg = pbar('batches', s_ep * (bpe_train + bpe_val), message(-1, -1))
+        pb = pbar('batches', s_ep * (bpe_train + bpe_val), ['te', 'tr'])
         pb.start()
 
 
@@ -127,11 +127,12 @@ class LasagneTrainer(BaseCook):
         te_err = np.mean(val_err_hist[-l2:])
         tr_err = np.mean(train_err_hist[-l1:])
         max_err = tr_err
-        msg.message = message(te_err, tr_err)
+        pb.dynamic_messages['tr'] = tr_err
+        pb.dynamic_messages['te'] = te_err
 
         prev_p, p = (None, None)
         @contextmanager
-        def reset_if_nan(m):
+        def reset_if_nan():
             nonlocal p, prev_p
             prev_p, p = p, self.recipe.get_all_params_copy()
             yield
@@ -139,18 +140,18 @@ class LasagneTrainer(BaseCook):
                 p, prev_p = prev_p, None
                 if p:
                     self.recipe.set_all_params(p)
-                    m.message = 'nan results, retrying...'
                 else:
                     raise AttributeError('Recived non-recoverable NaN results')
 
         for j in range(self.opt.start_epochs - 1):
-            with reset_if_nan(msg):
+            with reset_if_nan():
                 train_err_hist.extend(move_pbar(pb, self.train(1)))
                 val_err_hist.extend(move_pbar(pb, self.val(1)))
 
                 te_err = np.mean(val_err_hist[-l2:])
                 tr_err = np.mean(train_err_hist[-l1:])
-                msg.message = message(te_err, tr_err)
+                pb.dynamic_messages['tr'] = tr_err
+                pb.dynamic_messages['te'] = te_err
         pb.finish()
 
         perf_tol = self.opt.get('perf_tol', 0.0)
@@ -161,16 +162,17 @@ class LasagneTrainer(BaseCook):
         te_err = te_err if not np.isnan(te_err) else max_err * 10
         val_err = deque([te_err])
 
-        pb, msg = pbar('epochs', self.opt.decay_epochs, message(te_err, tr_err))
+        pb = pbar('epochs', self.opt.decay_epochs, ['te', 'tr'])
         for _i in pb(range(self.opt.decay_epochs)):
             i = _i + 1
             try:
-                with reset_if_nan(msg):
+                with reset_if_nan():
                     train_err_hist.extend(self.train(1))
                     val_err_hist.extend(self.val(1))
                     te_err = np.mean(val_err_hist[-l2:])
                     tr_err = np.mean(train_err_hist[-l1:])
-                    msg.message = message(te_err, tr_err)
+                    pb.dynamic_messages['tr'] = tr_err
+                    pb.dynamic_messages['te'] = te_err
                     te_err = te_err if not np.isnan(te_err) else max_err * 10
             except KeyboardInterrupt:
                 break
